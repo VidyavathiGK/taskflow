@@ -1,0 +1,64 @@
+{% extends 'base.html' %}
+
+{% block title %}My Boards - TaskFlow{% endblock %}
+
+{% block content %}
+<div class="dashboard-header">
+  <div>
+    <h1 class="dashboard-title">My Boards</h1>
+    <p style="color: var(--text-muted); font-size: 0.95rem; margin-top: 0.25rem;">
+      Workspaces you own or collaborate on.
+    </p>
+  </div>
+  <a href="{% url 'boards:board_create' %}" class="btn btn-primary">
+    <span>+</span> Create New Board
+  </a>
+</div>
+
+{% if memberships %}
+  <div class="boards-grid">
+    {% for membership in memberships %}
+      <div class="board-card">
+        <div>
+          <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.5rem;">
+            <a href="{% url 'boards:board_detail' board_id=membership.board.id %}" class="board-card-title">
+              {{ membership.board.title }}
+            </a>
+            <span class="role-badge role-badge-{{ membership.role|lower }}">
+              {{ membership.role }}
+            </span>
+          </div>
+
+          <p class="board-card-desc">
+            {{ membership.board.description|default:"No description provided for this board."|truncatewords:20 }}
+          </p>
+        </div>
+
+        <div class="board-card-footer">
+          <div class="board-card-owner">
+            <span class="avatar-bubble avatar-bubble-sm" style="background-color: {{ membership.board.owner.avatar_color|default:'#4F46E5' }};">
+              {{ membership.board.owner.initials }}
+            </span>
+            <span>Owner: @{{ membership.board.owner.username }}</span>
+          </div>
+
+          <a href="{% url 'boards:board_detail' board_id=membership.board.id %}" class="btn btn-secondary btn-sm">
+            Open Board &rarr;
+          </a>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">📋</div>
+    <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0.5rem;">No boards found</h2>
+    <p style="color: var(--text-muted); max-width: 420px; margin: 0 auto 1.5rem auto;">
+      You aren't a member of any task boards yet. Create your first workspace to start organizing tasks!
+    </p>
+    <a href="{% url 'boards:board_create' %}" class="btn btn-primary">
+      Create Your First Board
+    </a>
+  </div>
+{% endif %}
+{% endblock %}

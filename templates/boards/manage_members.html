@@ -1,0 +1,147 @@
+{% extends 'base.html' %}
+
+{% block title %}Manage Members - {{ board.title }}{% endblock %}
+
+{% block content %}
+<div class="container-medium">
+  <!-- Back navigation and header -->
+  <div style="margin-bottom: 1.5rem; display: flex; align-items: center; justify-content: space-between;">
+    <div>
+      <a href="{% url 'boards:board_detail' board_id=board.id %}" style="font-size: 0.875rem; font-weight: 500;">
+        &larr; Back to {{ board.title }}
+      </a>
+      <h1 class="panel-title" style="margin-top: 0.5rem;">Manage Members & Roles</h1>
+      <p class="panel-subtitle">Workspace: <strong>{{ board.title }}</strong> &bull; Only the OWNER can modify collaborator roles.</p>
+    </div>
+  </div>
+
+  <!-- Add New Member Panel -->
+  <div class="panel" style="margin-bottom: 2rem;">
+    <h2 style="font-size: 1.15rem; font-weight: 700; margin-bottom: 0.25rem;">Add Collaborator</h2>
+    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
+      Invite an existing registered user by their username or email address.
+    </p>
+
+    <form method="post" action="{% url 'boards:manage_members' board_id=board.id %}">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="add_member">
+
+      {% if add_form.non_field_errors %}
+        <div class="alert alert-error">
+          {% for error in add_form.non_field_errors %}
+            <div>{{ error }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <div style="display: grid; grid-template-columns: 2fr 1.5fr auto; gap: 1rem; align-items: start;">
+        <div>
+          <label for="{{ add_form.identifier.id_for_label }}" class="form-label">Username or Email</label>
+          {{ add_form.identifier }}
+          {% if add_form.identifier.errors %}
+            <div class="form-error">{{ add_form.identifier.errors.0 }}</div>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="{{ add_form.role.id_for_label }}" class="form-label">Role</label>
+          {{ add_form.role }}
+          {% if add_form.role.errors %}
+            <div class="form-error">{{ add_form.role.errors.0 }}</div>
+          {% endif %}
+        </div>
+
+        <div>
+          <label class="form-label" style="visibility: hidden;">Submit</label>
+          <button type="submit" class="btn btn-primary">
+            + Add Member
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <!-- Current Members Table -->
+  <div class="panel">
+    <h2 style="font-size: 1.15rem; font-weight: 700; margin-bottom: 0.25rem;">
+      Current Workspace Members ({{ memberships.count }})
+    </h2>
+    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+      The board OWNER holds administrative privileges and cannot be removed or demoted.
+    </p>
+
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Member</th>
+          <th>Role</th>
+          <th>Change Role</th>
+          <th style="text-align: right;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in memberships %}
+          <tr>
+            <td>
+              <div class="member-cell">
+                <span class="avatar-bubble" style="background-color: {{ m.user.avatar_color|default:'#4F46E5' }};">
+                  {{ m.user.initials }}
+                </span>
+                <div>
+                  <div class="member-name">
+                    @{{ m.user.username }}
+                    {% if m.user == board.owner %}
+                      <span style="font-size: 0.75rem; color: var(--primary); font-weight: 700; margin-left: 0.25rem;">(Owner)</span>
+                    {% endif %}
+                  </div>
+                  <div class="member-email">{{ m.user.email|default:"No email registered" }}</div>
+                </div>
+              </div>
+            </td>
+
+            <td>
+              <span class="role-badge role-badge-{{ m.role|lower }}">
+                {{ m.role }}
+              </span>
+            </td>
+
+            <td>
+              {% if m.role == 'OWNER' or m.user == board.owner %}
+                <span style="font-size: 0.85rem; color: var(--text-muted); font-style: italic;">
+                  Owner role fixed
+                </span>
+              {% else %}
+                <form method="post" action="{% url 'boards:manage_members' board_id=board.id %}" style="display: flex; gap: 0.5rem; align-items: center; margin: 0;">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="change_role">
+                  <input type="hidden" name="membership_id" value="{{ m.id }}">
+                  <select name="role" class="form-select form-select-sm" style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.85rem;">
+                    <option value="EDITOR" {% if m.role == 'EDITOR' %}selected{% endif %}>Editor</option>
+                    <option value="VIEWER" {% if m.role == 'VIEWER' %}selected{% endif %}>Viewer</option>
+                  </select>
+                  <button type="submit" class="btn btn-secondary btn-sm">Update</button>
+                </form>
+              {% endif %}
+            </td>
+
+            <td style="text-align: right;">
+              {% if m.role == 'OWNER' or m.user == board.owner %}
+                <span style="font-size: 0.85rem; color: var(--text-light);">&mdash;</span>
+              {% else %}
+                <form method="post" action="{% url 'boards:manage_members' board_id=board.id %}" style="display: inline; margin: 0;" onsubmit="return confirm('Are you sure you want to remove @{{ m.user.username }} from this board?');">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="remove_member">
+                  <input type="hidden" name="membership_id" value="{{ m.id }}">
+                  <button type="submit" class="btn btn-outline-danger btn-sm">
+                    Remove
+                  </button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

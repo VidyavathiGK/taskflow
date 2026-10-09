@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+
+{% block title %}Edit {{ board.title }} - TaskFlow{% endblock %}
+
+{% block content %}
+<div class="container-narrow">
+  <div class="panel">
+    <div class="panel-header">
+      <h1 class="panel-title">Edit Board Details</h1>
+      <p class="panel-subtitle">Update workspace title and description settings.</p>
+    </div>
+
+    <form method="post" action="{% url 'boards:board_edit' board_id=board.id %}">
+      {% csrf_token %}
+
+      {% if form.non_field_errors %}
+        <div class="alert alert-error">
+          {% for error in form.non_field_errors %}
+            <div>{{ error }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <div class="form-group">
+        <label for="{{ form.title.id_for_label }}" class="form-label">Board Title</label>
+        {{ form.title }}
+        {% if form.title.errors %}
+          <div class="form-error">{{ form.title.errors.0 }}</div>
+        {% endif %}
+      </div>
+
+      <div class="form-group">
+        <label for="{{ form.description.id_for_label }}" class="form-label">Description</label>
+        {{ form.description }}
+        {% if form.description.errors %}
+          <div class="form-error">{{ form.description.errors.0 }}</div>
+        {% endif %}
+      </div>
+
+      <div style="display: flex; gap: 1rem; margin-top: 1.75rem;">
+        <button type="submit" class="btn btn-primary" style="flex: 1;">
+          Save Changes
+        </button>
+        <a href="{% url 'boards:board_detail' board_id=board.id %}" class="btn btn-secondary">
+          Cancel
+        </a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

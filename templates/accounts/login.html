@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+
+{% block title %}Log In - TaskFlow{% endblock %}
+
+{% block content %}
+<div class="container-narrow">
+  <div class="panel">
+    <div class="panel-header">
+      <h1 class="panel-title">Welcome back to TaskFlow</h1>
+      <p class="panel-subtitle">Sign in to manage and collaborate on your task boards.</p>
+    </div>
+
+    <form method="post" action="{% url 'accounts:login' %}">
+      {% csrf_token %}
+
+      {% if form.non_field_errors %}
+        <div class="alert alert-error">
+          {% for error in form.non_field_errors %}
+            <div>{{ error }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <div class="form-group">
+        <label for="id_username" class="form-label">Username</label>
+        <input type="text" name="username" id="id_username" class="form-control" autofocus required placeholder="Enter your username">
+      </div>
+
+      <div class="form-group">
+        <label for="id_password" class="form-label">Password</label>
+        <input type="password" name="password" id="id_password" class="form-control" required placeholder="Enter your password">
+      </div>
+
+      <button type="submit" class="btn btn-primary btn-block" style="margin-top: 1.5rem;">
+        Log In
+      </button>
+    </form>
+
+    <div style="margin-top: 1.5rem; text-align: center; font-size: 0.9rem; color: var(--text-muted);">
+      Don't have an account? <a href="{% url 'accounts:signup' %}">Create one here</a>
+    </div>
+
+    <!-- Demo testing hint for instant verification -->
+    <div class="demo-hint-box">
+      <div class="demo-hint-title">💡 Seeded Demo Users:</div>
+      <div><strong>alice</strong> (Owner) &bull; <strong>bob</strong> (Editor) &bull; <strong>charlie</strong> (Viewer)</div>
+      <div style="margin-top: 0.25rem;">Password: <code>password123</code></div>
+    </div>
+  </div>
+</div>
+{% endblock %}

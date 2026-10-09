@@ -1,0 +1,117 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ board.title }} - TaskFlow{% endblock %}
+
+{% block content %}
+<!-- Board Header Information & Member Bar -->
+<div class="board-header">
+  <div class="board-header-top">
+    <div>
+      <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.35rem;">
+        <h1 class="board-title-main">{{ board.title }}</h1>
+        <span class="role-badge role-badge-{{ current_membership.role|lower }}">
+          Your Role: {{ current_membership.role }}
+        </span>
+      </div>
+      {% if board.description %}
+        <p class="board-desc-main">{{ board.description }}</p>
+      {% endif %}
+    </div>
+
+    <!-- Actions restricted strictly to Board OWNER -->
+    <div class="board-actions">
+      {% if is_owner %}
+        <a href="{% url 'boards:manage_members' board_id=board.id %}" class="btn btn-secondary btn-sm">
+          👥 Manage Members
+        </a>
+        <a href="{% url 'boards:board_edit' board_id=board.id %}" class="btn btn-secondary btn-sm">
+          ✏️ Edit Board
+        </a>
+        <a href="{% url 'boards:board_delete' board_id=board.id %}" class="btn btn-outline-danger btn-sm">
+          🗑️ Delete Board
+        </a>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Members Roster -->
+  <div class="board-meta-bar">
+    <div class="board-members-roster">
+      <span class="members-label">Members ({{ memberships.count }}):</span>
+      {% for m in memberships %}
+        <div style="display: inline-flex; align-items: center; gap: 0.35rem; margin-right: 0.75rem;" title="@{{ m.user.username }} - {{ m.role }}">
+          <span class="avatar-bubble avatar-bubble-sm" style="background-color: {{ m.user.avatar_color|default:'#4F46E5' }};">
+            {{ m.user.initials }}
+          </span>
+          <span style="font-size: 0.825rem; font-weight: 500;">
+            @{{ m.user.username }}
+            <span class="role-badge role-badge-{{ m.role|lower }}" style="font-size: 0.65rem; padding: 0.1rem 0.4rem; margin-left: 0.2rem;">
+              {{ m.role }}
+            </span>
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div style="font-size: 0.8rem; color: var(--text-light);">
+      Updated: {{ board.updated_at|date:"M d, Y" }}
+    </div>
+  </div>
+</div>
+
+<!-- Phase 1 Informational Notice -->
+<div class="phase-notice">
+  <div>
+    <strong>ℹ️ Phase 1 Read-Only View:</strong> Lists and Cards below are displayed in read-only mode. In this phase, lists and cards can be created or managed via the <a href="/admin/boards/" target="_blank" style="font-weight: 600; text-decoration: underline;">Django Admin</a> or seeded via <code>seed_demo</code>. Full interactive drag-and-drop & creation will be unlocked in Phase 2.
+  </div>
+</div>
+
+<!-- Kanban Columns & Cards View -->
+{% if lists %}
+  <div class="kanban-board">
+    {% for col in lists %}
+      <div class="kanban-column">
+        <div class="column-header">
+          <span>{{ col.title }}</span>
+          <span class="column-count">{{ col.cards.count }}</span>
+        </div>
+
+        <div class="column-cards-container">
+          {% for card in col.cards.all %}
+            <div class="task-card">
+              <div class="task-card-title">{{ card.title }}</div>
+              {% if card.description %}
+                <div class="task-card-desc">{{ card.description }}</div>
+              {% endif %}
+              <div class="task-card-footer">
+                <div class="task-card-author">
+                  <span class="avatar-bubble avatar-bubble-sm" style="width: 18px; height: 18px; font-size: 0.6rem; background-color: {{ card.created_by.avatar_color|default:'#4F46E5' }};">
+                    {{ card.created_by.initials }}
+                  </span>
+                  <span>@{{ card.created_by.username }}</span>
+                </div>
+                <span>#{{ card.position }}</span>
+              </div>
+            </div>
+          {% empty %}
+            <div style="text-align: center; color: var(--text-light); font-size: 0.85rem; padding: 1.5rem 0.5rem;">
+              No cards in this list
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">📋</div>
+    <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem;">No lists on this board yet</h2>
+    <p style="color: var(--text-muted); max-width: 450px; margin: 0 auto 1rem auto; font-size: 0.9rem;">
+      In Phase 1, lists and cards are created through the Django Admin panel or the demo seed command.
+    </p>
+    <a href="/admin/boards/boardlist/add/" target="_blank" class="btn btn-secondary btn-sm">
+      Add Column in Django Admin &rarr;
+    </a>
+  </div>
+{% endif %}
+{% endblock %}

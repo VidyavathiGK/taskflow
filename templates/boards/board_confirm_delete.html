@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+
+{% block title %}Delete {{ board.title }} - TaskFlow{% endblock %}
+
+{% block content %}
+<div class="container-narrow">
+  <div class="panel" style="border-color: #fca5a5;">
+    <div class="panel-header">
+      <h1 class="panel-title" style="color: var(--danger);">Delete Board Workspace</h1>
+      <p class="panel-subtitle">This action is permanent and cannot be undone.</p>
+    </div>
+
+    <div class="alert alert-danger" style="margin-bottom: 1.5rem;">
+      <strong>⚠️ Warning:</strong> Deleting <strong>"{{ board.title }}"</strong> will permanently delete all columns, task cards, and member associations within this workspace.
+    </div>
+
+    <form method="post" action="{% url 'boards:board_delete' board_id=board.id %}">
+      {% csrf_token %}
+      <div style="display: flex; gap: 1rem;">
+        <button type="submit" class="btn btn-danger" style="flex: 1;">
+          Yes, Permanently Delete
+        </button>
+        <a href="{% url 'boards:board_detail' board_id=board.id %}" class="btn btn-secondary">
+          Cancel
+        </a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
