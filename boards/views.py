@@ -1,18 +1,25 @@
 """
-Views for Board workspace CRUD and Member management.
+Views for Board workspace CRUD, Member management, and Phase 2 JSON API endpoints.
 """
 
+import json
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.http import Http404
+from django.http import Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
 
 from .forms import AddMemberForm, BoardForm, UpdateMemberRoleForm
-from .models import Board, BoardMembership
+from .models import Board, BoardList, BoardMembership, Card
 from .permissions import BoardAccessMixin, BoardOwnerRequiredMixin
+from . import services
 
+
+# ==============================================================================
+# HTML TEMPLATE VIEWS (Phase 1)
+# ==============================================================================
 
 class MyBoardsView(LoginRequiredMixin, View):
     """
@@ -65,8 +72,8 @@ class BoardCreateView(LoginRequiredMixin, View):
 
 class BoardDetailView(BoardAccessMixin, View):
     """
-    Renders the board workspace detail view.
-    Displays title, description, member roster, and read-only lists and cards.
+    Renders the interactive board workspace detail view.
+    Displays title, description, member roster, and Kanban lists and cards.
     """
     template_name = "boards/board_detail.html"
 
@@ -90,6 +97,10 @@ class BoardDetailView(BoardAccessMixin, View):
             "current_membership": self.membership,
             "is_owner": self.membership.role == BoardMembership.Role.OWNER,
             "is_editor": self.membership.role in [
+                BoardMembership.Role.OWNER,
+                BoardMembership.Role.EDITOR,
+            ],
+            "can_edit": self.membership.role in [
                 BoardMembership.Role.OWNER,
                 BoardMembership.Role.EDITOR,
             ],
@@ -136,10 +147,6 @@ class BoardDeleteView(BoardOwnerRequiredMixin, View):
 class BoardMembersView(BoardOwnerRequiredMixin, View):
     """
     Manage Members page (strictly restricted to board OWNER).
-    Supports:
-    - Adding a member by username or email with an initial role (EDITOR or VIEWER)
-    - Changing an existing member's role (OWNER cannot be demoted)
-    - Removing a member (OWNER cannot be removed)
     """
     template_name = "boards/manage_members.html"
 
@@ -226,3 +233,206 @@ class BoardMembersView(BoardOwnerRequiredMixin, View):
 
         messages.error(request, "Unknown action requested.")
         return redirect("boards:manage_members", board_id=self.board.id)
+
+
+# ==============================================================================
+# PHASE 2: JSON API BASE & MUTATION ENDPOINTS
+# ==============================================================================
+
+class BoardApiView(BoardAccessMixin, View):
+    """
+    Base view for Phase 2 JSON API endpoints.
+    Reuses Phase 1 BoardAccessMixin:
+    - Non-members automatically get 404 Http404 (preventing workspace enumeration).
+    - Unauthenticated requests are rejected.
+    - Captures domain and permission exceptions, converting them into standard JSON responses.
+    """
+
+    def parse_payload(self, request):
+        """Parse request body as JSON if Content-Type is application/json, else fallback to POST."""
+        content_type = request.content_type or ""
+        if "application/json" in content_type:
+            try:
+                body_str = request.body.decode("utf-8") if request.body else "{}"
+                return json.loads(body_str or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
+        return request.POST
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method != "POST":
+            return JsonResponse({"ok": False, "error": "Method not allowed. Use POST."}, status=405)
+
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        except PermissionDenied as e:
+            return JsonResponse({"ok": False, "error": str(e)}, status=403)
+        except ValueError as e:
+            return JsonResponse({"ok": False, "error": str(e)}, status=400)
+
+
+class ListCreateApiView(BoardApiView):
+    """POST /boards/<board_id>/lists/create/"""
+    def post(self, request, board_id):
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        title = payload.get("title")
+        new_list = services.create_list(self.board, title, request.user)
+        return JsonResponse({
+            "ok": True,
+            "list": {
+                "id": new_list.id,
+                "title": new_list.title,
+                "position": new_list.position,
+            }
+        })
+
+
+class ListRenameApiView(BoardApiView):
+    """POST /boards/<board_id>/lists/<list_id>/rename/"""
+    def post(self, request, board_id, list_id):
+        board_list = get_object_or_404(BoardList, id=list_id, board=self.board)
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        title = payload.get("title")
+        updated_list = services.rename_list(board_list, title, request.user)
+        return JsonResponse({
+            "ok": True,
+            "list": {
+                "id": updated_list.id,
+                "title": updated_list.title,
+                "position": updated_list.position,
+            }
+        })
+
+
+class ListDeleteApiView(BoardApiView):
+    """POST /boards/<board_id>/lists/<list_id>/delete/"""
+    def post(self, request, board_id, list_id):
+        board_list = get_object_or_404(BoardList, id=list_id, board=self.board)
+        services.delete_list(board_list, request.user)
+        return JsonResponse({"ok": True})
+
+
+class ListMoveApiView(BoardApiView):
+    """POST /boards/<board_id>/lists/<list_id>/move/"""
+    def post(self, request, board_id, list_id):
+        board_list = get_object_or_404(BoardList, id=list_id, board=self.board)
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        new_position = payload.get("new_position")
+        if new_position is None:
+            return JsonResponse({"ok": False, "error": "Missing 'new_position' field."}, status=400)
+
+        try:
+            new_position_int = int(new_position)
+        except (ValueError, TypeError):
+            return JsonResponse({"ok": False, "error": "'new_position' must be an integer."}, status=400)
+
+        moved_list = services.move_list(board_list, new_position_int, request.user)
+        return JsonResponse({
+            "ok": True,
+            "list": {
+                "id": moved_list.id,
+                "position": moved_list.position,
+            }
+        })
+
+
+class CardCreateApiView(BoardApiView):
+    """POST /boards/<board_id>/lists/<list_id>/cards/create/"""
+    def post(self, request, board_id, list_id):
+        board_list = get_object_or_404(BoardList, id=list_id, board=self.board)
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        title = payload.get("title")
+        description = payload.get("description", "")
+        card = services.create_card(board_list, title, description, request.user)
+        return JsonResponse({
+            "ok": True,
+            "card": {
+                "id": card.id,
+                "title": card.title,
+                "description": card.description,
+                "position": card.position,
+                "list_id": card.board_list_id,
+                "author": card.created_by.username,
+                "author_initials": card.created_by.initials,
+                "author_color": getattr(card.created_by, "avatar_color", "#4F46E5"),
+            }
+        })
+
+
+class CardUpdateApiView(BoardApiView):
+    """POST /boards/<board_id>/cards/<card_id>/update/"""
+    def post(self, request, board_id, card_id):
+        card = get_object_or_404(Card, id=card_id, board_list__board=self.board)
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        title = payload.get("title")
+        description = payload.get("description")
+        updated_card = services.update_card(card, title, description, request.user)
+        return JsonResponse({
+            "ok": True,
+            "card": {
+                "id": updated_card.id,
+                "title": updated_card.title,
+                "description": updated_card.description,
+                "position": updated_card.position,
+                "list_id": updated_card.board_list_id,
+            }
+        })
+
+
+class CardDeleteApiView(BoardApiView):
+    """POST /boards/<board_id>/cards/<card_id>/delete/"""
+    def post(self, request, board_id, card_id):
+        card = get_object_or_404(Card, id=card_id, board_list__board=self.board)
+        services.delete_card(card, request.user)
+        return JsonResponse({"ok": True})
+
+
+class CardMoveApiView(BoardApiView):
+    """POST /boards/<board_id>/cards/<card_id>/move/"""
+    def post(self, request, board_id, card_id):
+        card = get_object_or_404(Card, id=card_id, board_list__board=self.board)
+        payload = self.parse_payload(request)
+        if payload is None:
+            return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
+
+        target_list_id = payload.get("target_list_id")
+        new_position = payload.get("new_position")
+
+        if target_list_id is None or new_position is None:
+            return JsonResponse(
+                {"ok": False, "error": "Missing 'target_list_id' or 'new_position'."},
+                status=400
+            )
+
+        try:
+            new_position_int = int(new_position)
+        except (ValueError, TypeError):
+            return JsonResponse({"ok": False, "error": "'new_position' must be an integer."}, status=400)
+
+        # Enforce target list belongs to the same board workspace (returns 404 otherwise)
+        target_list = get_object_or_404(BoardList, id=target_list_id, board=self.board)
+
+        moved_card = services.move_card(card, target_list, new_position_int, request.user)
+        return JsonResponse({
+            "ok": True,
+            "card": {
+                "id": moved_card.id,
+                "list_id": moved_card.board_list_id,
+                "position": moved_card.position,
+            }
+        })

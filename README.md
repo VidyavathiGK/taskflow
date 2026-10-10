@@ -1,14 +1,19 @@
 # TaskFlow — Real-time Collaborative Task Board (Trello-Lite)
 
-> **Phase 1: Project Skeleton, Core Schema, Authentication & Board Management**
+> **Phase 2: Interactive Kanban Board, Service Layer, Drag-and-Drop & RBAC Mutations**
 
-TaskFlow is a collaborative Kanban task board built with Python 3.12 and Django 5.x on top of PostgreSQL.
+TaskFlow is a collaborative Kanban task board built with Python 3.12+ and Django 5.x on top of PostgreSQL.
 
-In **Phase 1**, the project establishes:
+In **Phase 1 & 2**, the project establishes:
 - Secure authentication with a custom User model (equipped with `avatar_color` for live presence in later phases).
 - Relational schema with role-based access control (RBAC): `Board`, `BoardMembership`, `BoardList`, and `Card`.
 - Centralized access control returning `404 Not Found` for non-members to prevent workspace enumeration.
 - Board workspace CRUD, member invitations, role promotions, and member removals restricted to the workspace `OWNER`.
+- **Dedicated business logic service layer** (`boards/services.py`) encapsulating all list and card mutations with `select_for_update()` concurrency locks.
+- **Contiguous integer sequence ordering** with automatic gap closure and renumbering.
+- **Dynamic drag-and-drop** with vendored SortableJS for horizontal column reordering and cross-column card moves.
+- **Optimistic UI updates with automated rollback** on server rejection or network loss.
+- **Inline forms & modal dialogs** for list/card creation, in-place title renaming, editing, and deletion warnings.
 - Django Admin with nested inlines for convenient entity inspection.
 - A `seed_demo` management command for instant local testing.
 
@@ -193,3 +198,76 @@ All authorization checks are consolidated in `get_board_for_member` and `BoardAc
    Views modifying workspace metadata (`BoardUpdateView`, `BoardDeleteView`, `BoardMembersView`) inherit from `BoardOwnerRequiredMixin`. Non-members receive `404`, and non-owner members receive `403 PermissionDenied`.
 3. **Owner Invariant Protection:**
    The board owner cannot be removed or demoted from the workspace, preventing orphaned boards.
+
+---
+
+## ⚡ Phase 2: Interactive Kanban, Service Layer & Ordering Engine
+
+### 1. Business Logic Service Layer (`boards/services.py`)
+To maintain separation of concerns and prepare for WebSocket broadcasts in Phase 3, all mutation operations are isolated into pure service functions:
+
+| Service Function | Responsibility | Return Value |
+| :--- | :--- | :--- |
+| `create_list(board, title, user)` | Appends column at end (`position = count`) | Created `BoardList` |
+| `rename_list(board_list, new_title, user)` | Updates column header title | Updated `BoardList` |
+| `delete_list(board_list, user)` | Cascades cards and renumbers remaining columns | `None` |
+| `move_list(board_list, new_position, user)` | Reorders column within board; renumbers siblings | Updated `BoardList` |
+| `create_card(board_list, title, description, user)` | Appends card at bottom of column (`position = count`) | Created `Card` |
+| `update_card(card, title, description, user)` | Modifies task card title/description | Updated `Card` |
+| `delete_card(card, user)` | Deletes card and renumbers list to close gap | `None` |
+| `move_card(card, target_list, new_position, user)` | Moves card within list or across columns with renumbering | Updated `Card` |
+
+Views act purely as thin HTTP/JSON adapters, delegating all domain logic and validation to this module.
+
+### 2. Ordering Strategy & Tradeoff Analysis
+
+TaskFlow uses **Contiguous Integer Sequence Positioning** (`0, 1, 2, ... N-1`):
+
+* **How It Works:**
+  1. Moving an item removes it from its current position, closing the sequence gap.
+  2. The item is inserted at the desired destination index.
+  3. Neighboring rows are renumbered so indices remain contiguous zero-indexed integers without holes or duplicates.
+
+* **Tradeoff Comparison:**
+
+| Strategy | Pros | Cons / Tradeoffs | Decision in TaskFlow |
+| :--- | :--- | :--- | :--- |
+| **Contiguous Integers** *(Selected)* | Deterministic sorting, human-readable, zero risk of precision exhaustion, zero database bloat | Requires $O(N)$ write updates on adjacent rows during moves | **Adopted**: Columns rarely exceed 50–100 cards; indexed updates execute in <5ms inside transactions |
+| **Fractional / Float Indexing** | Single-row update ($O(1)$) by taking midpoint $(a + b) / 2$ | Rapidly collapses due to IEEE 754 precision exhaustion; requires background rebalancing jobs | **Rejected**: High complexity and precision failure risks |
+| **LexoRank / String Keys** | Single-row update using alphanumeric midpoint strings | String storage overhead, complex boundary generation, eventual string bloat | **Rejected**: Overkill for Kanban workload |
+
+* **Race Condition Protection:**
+  Multi-row renumbering is locked using `transaction.atomic()` and `select_for_update()`. This serializes concurrent drag-and-drop operations, preventing sequence duplication or interleaving.
+
+### 3. Drag-and-Drop Implementation
+* **Library:** [SortableJS](https://github.com/SortableJS/Sortable) vendored directly into `static/vendor/sortable.min.js`.
+* **Why Vendored?** Eliminates CDN latency, provides offline resilience, and prevents external CDN outages from breaking internal workflows.
+* **Optimistic UI with Rollback:** On drop, the DOM changes immediately. If the server rejects the request (e.g. permission error, session timeout), the script catches the failure, reverts the DOM element back to its original parent and position, and displays an informative toast notification.
+
+### 4. RESTful JSON Mutation Endpoints
+
+All endpoints require CSRF authentication and accept HTTP `POST`:
+
+| Method | Endpoint URL | Input Payload | Status Codes | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `POST` | `/boards/<b_id>/lists/create/` | `{"title": "..."}` | 200, 400, 403, 404 | Appends a column |
+| `POST` | `/boards/<b_id>/lists/<l_id>/rename/` | `{"title": "..."}` | 200, 400, 403, 404 | Renames a column |
+| `POST` | `/boards/<b_id>/lists/<l_id>/delete/` | `{}` | 200, 403, 404 | Deletes column and its cards |
+| `POST` | `/boards/<b_id>/lists/<l_id>/move/` | `{"new_position": 1}` | 200, 400, 403, 404 | Repositions a column |
+| `POST` | `/boards/<b_id>/lists/<l_id>/cards/create/` | `{"title": "...", "description": "..."}` | 200, 400, 403, 404 | Appends a card |
+| `POST` | `/boards/<b_id>/cards/<c_id>/update/` | `{"title": "...", "description": "..."}` | 200, 400, 403, 404 | Updates card title/desc |
+| `POST` | `/boards/<b_id>/cards/<c_id>/delete/` | `{}` | 200, 403, 404 | Deletes card |
+| `POST` | `/boards/<b_id>/cards/<c_id>/move/` | `{"target_list_id": 2, "new_position": 0}` | 200, 400, 403, 404 | Moves card within or across lists |
+
+### 5. Role & Permission Matrix (Role $\times$ Action)
+
+| Action | Workspace `OWNER` | `EDITOR` | `VIEWER` | Non-Member / Anonymous |
+| :--- | :---: | :---: | :---: | :---: |
+| **View Board & Cards** | ✅ Yes | ✅ Yes | ✅ Yes (Read-Only) | ❌ **404 Not Found** |
+| **Create / Rename / Delete Lists** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Reorder Lists (Drag & Drop)** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Create / Update / Delete Cards** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Move Cards (Drag & Drop)** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Manage Members (Add / Change Roles)**| ✅ Yes | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Edit Board Metadata / Delete Board** | ✅ Yes | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+
