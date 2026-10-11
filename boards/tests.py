@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
 from boards.models import Board, BoardList, BoardMembership, Card
@@ -397,3 +397,129 @@ class BoardsPhase2ApiTests(TestCase):
             "new_position": 0,
         }, content_type="application/json")
         self.assertEqual(res.status_code, 404)
+
+
+# ==============================================================================
+# PHASE 3 TESTS: WEBSOCKET CONSUMERS, SNAPSHOT API & RESILIENCE
+# ==============================================================================
+
+from unittest.mock import patch
+from django.contrib.auth.models import AnonymousUser
+from channels.testing import WebsocketCommunicator
+from boards.consumers import BoardConsumer
+
+
+class BoardsPhase3WebsocketTests(TransactionTestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="alice", password="password123")
+        self.editor = User.objects.create_user(username="bob", password="password123")
+        self.viewer = User.objects.create_user(username="charlie", password="password123")
+        self.outsider = User.objects.create_user(username="stranger", password="password123")
+
+        self.board = Board.objects.create(title="Sprint Board", owner=self.owner)
+        BoardMembership.objects.create(board=self.board, user=self.owner, role=BoardMembership.Role.OWNER)
+        BoardMembership.objects.create(board=self.board, user=self.editor, role=BoardMembership.Role.EDITOR)
+        BoardMembership.objects.create(board=self.board, user=self.viewer, role=BoardMembership.Role.VIEWER)
+
+    async def test_authenticated_member_connects_successfully(self):
+        communicator = WebsocketCommunicator(BoardConsumer.as_asgi(), f"ws/boards/{self.board.id}/")
+        communicator.scope["url_route"] = {"kwargs": {"board_id": self.board.id}}
+        communicator.scope["user"] = self.editor
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # Test keepalive ping/pong
+        await communicator.send_json_to({"type": "ping"})
+        response = await communicator.receive_json_from()
+        self.assertEqual(response, {"type": "pong"})
+
+        await communicator.disconnect()
+
+    async def test_anonymous_user_rejected_with_4401(self):
+        communicator = WebsocketCommunicator(BoardConsumer.as_asgi(), f"ws/boards/{self.board.id}/")
+        communicator.scope["url_route"] = {"kwargs": {"board_id": self.board.id}}
+        communicator.scope["user"] = AnonymousUser()
+
+        connected, code = await communicator.connect()
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+
+    async def test_non_member_rejected_with_4404(self):
+        """Anti-enumeration invariant: Non-members receive 4404, not 4403."""
+        communicator = WebsocketCommunicator(BoardConsumer.as_asgi(), f"ws/boards/{self.board.id}/")
+        communicator.scope["url_route"] = {"kwargs": {"board_id": self.board.id}}
+        communicator.scope["user"] = self.outsider
+
+        connected, code = await communicator.connect()
+        self.assertFalse(connected)
+        self.assertEqual(code, 4404)
+
+    async def test_client_mutation_over_websocket_rejected(self):
+        communicator = WebsocketCommunicator(BoardConsumer.as_asgi(), f"ws/boards/{self.board.id}/")
+        communicator.scope["url_route"] = {"kwargs": {"board_id": self.board.id}}
+        communicator.scope["user"] = self.editor
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # Attempt to mutate over WebSocket
+        await communicator.send_json_to({"type": "create_card", "title": "Malicious Card"})
+        response = await communicator.receive_json_from()
+        self.assertEqual(response.get("type"), "error")
+        self.assertIn("Mutations over WebSocket are rejected", response.get("message"))
+
+        await communicator.disconnect()
+
+
+class BoardsPhase3SnapshotAndResilienceTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="alice", password="password123")
+        self.editor = User.objects.create_user(username="bob", password="password123")
+        self.outsider = User.objects.create_user(username="stranger", password="password123")
+
+        self.board = Board.objects.create(title="Dev Board", owner=self.owner)
+        BoardMembership.objects.create(board=self.board, user=self.owner, role=BoardMembership.Role.OWNER)
+        BoardMembership.objects.create(board=self.board, user=self.editor, role=BoardMembership.Role.EDITOR)
+
+        self.col = BoardList.objects.create(board=self.board, title="Backlog", position=0)
+        self.card = Card.objects.create(board_list=self.col, title="Task A", position=0, created_by=self.owner)
+
+    def test_snapshot_api_returns_complete_board_hierarchy(self):
+        self.client.login(username="bob", password="password123")
+        url = reverse("boards:api_board_snapshot", kwargs={"board_id": self.board.id})
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, 200)
+
+        data = res.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["board"]["id"], self.board.id)
+        self.assertEqual(data["board"]["current_role"], "EDITOR")
+        self.assertTrue(data["board"]["can_edit"])
+        self.assertEqual(len(data["board"]["lists"]), 1)
+        self.assertEqual(data["board"]["lists"][0]["cards"][0]["title"], "Task A")
+
+    def test_snapshot_api_rejects_non_member_404(self):
+        self.client.login(username="stranger", password="password123")
+        url = reverse("boards:api_board_snapshot", kwargs={"board_id": self.board.id})
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, 404)
+
+    def test_broker_failure_does_not_break_service_mutations(self):
+        """Simulate Redis / Channel Layer downtime: service mutations must still succeed."""
+        with patch("boards.events.get_channel_layer") as mock_get_channel:
+            mock_channel = mock_get_channel.return_value
+            mock_channel.group_send.side_effect = ConnectionError("Redis server unreachable")
+
+            with self.captureOnCommitCallbacks(execute=True):
+                new_card = services.create_card(
+                    board_list=self.col,
+                    title="Resilient Task",
+                    description="Created while Redis down",
+                    user=self.editor
+                )
+
+            # Assert database transaction committed successfully despite broker failure
+            self.assertEqual(new_card.title, "Resilient Task")
+            self.assertTrue(Card.objects.filter(title="Resilient Task").exists())
+

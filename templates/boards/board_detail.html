@@ -11,6 +11,8 @@
 <div id="board-app"
      class="board-view-container"
      data-board-id="{{ board.id }}"
+     data-user-id="{{ request.user.id }}"
+     data-username="{{ request.user.username }}"
      data-can-edit="{% if can_edit %}true{% else %}false{% endif %}">
 
   <!-- Board Header Information & Member Bar -->
@@ -22,9 +24,13 @@
           <span class="role-badge role-badge-{{ current_membership.role|lower }}" id="user-role-badge">
             Your Role: {{ current_membership.role }}
           </span>
-          {% if not can_edit %}
-            <span class="readonly-pill">🔒 Read-Only</span>
-          {% endif %}
+          <span class="ws-status-badge ws-status-connecting" id="ws-status-indicator" title="Real-time sync status">
+            <span class="ws-status-dot"></span>
+            <span class="ws-status-text">Connecting...</span>
+          </span>
+          <span class="readonly-pill" id="readonly-indicator" style="{% if can_edit %}display: none;{% endif %}">
+            🔒 Read-Only
+          </span>
         </div>
         {% if board.description %}
           <p class="board-desc-main">{{ board.description }}</p>

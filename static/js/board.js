@@ -1,5 +1,5 @@
 /**
- * TaskFlow — Interactive Kanban Board Client Script (Phase 2)
+ * TaskFlow — Interactive Kanban Board & Real-Time Sync Client Script (Phase 2 & 3)
  *
  * Responsibilities:
  * - Initializes SortableJS on columns (horizontal) and cards (vertical + cross-column)
@@ -7,7 +7,11 @@
  * - Handles inline list title renaming and deletion confirmation
  * - Handles card detail viewing, updating, and deletion modal
  * - Enforces optimistic updates with automated rollback on server rejection
- * - Disables all mutations and drag handles for VIEWER roles
+ * - Manages WebSocket connection to ws/boards/<board_id>/ with auto-reconnect & exponential backoff
+ * - Implements echo cancellation using ephemeral tab client_id
+ * - Dispatches incoming real-time events to the DOM without full page reload
+ * - Reconciles board state via snapshot API on reconnection
+ * - Enforces role-based dynamic permissions (OWNER/EDITOR vs VIEWER)
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -15,7 +19,11 @@ document.addEventListener('DOMContentLoaded', () => {
   if (!boardApp) return;
 
   const boardId = boardApp.dataset.boardId;
-  const canEdit = boardApp.dataset.canEdit === 'true';
+  const currentUserId = parseInt(boardApp.dataset.userId, 10);
+  let canEdit = boardApp.dataset.canEdit === 'true';
+
+  // Ephemeral client ID generated per tab to prevent echoing own optimistic updates
+  const tabClientId = 'tab_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();
 
   // Helper: Retrieve CSRF token from page
   function getCsrfToken() {
@@ -58,13 +66,14 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/'/g, '&#039;');
   }
 
-  // Helper: Standardized AJAX JSON POST request
+  // Helper: Standardized AJAX JSON POST request with X-Client-ID header
   async function apiPost(url, data) {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-CSRFToken': getCsrfToken(),
+        'X-Client-ID': tabClientId,
       },
       body: JSON.stringify(data),
     });
@@ -96,11 +105,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ===========================================================================
-  // 1. DRAG AND DROP (SortableJS)
+  // 1. DRAG AND DROP (SortableJS) & COLLISION AVOIDANCE
   // ===========================================================================
 
   const cardSortables = [];
   let columnSortable = null;
+  let isLocallyDragging = false;
+  const queuedEvents = [];
 
   function initCardsSortable(containerEl) {
     if (!containerEl || typeof Sortable === 'undefined') return;
@@ -114,13 +125,16 @@ document.addEventListener('DOMContentLoaded', () => {
       chosenClass: 'sortable-chosen',
       fallbackTolerance: 3,
 
-      // Track source position before drag begins to allow rollback
       onStart: (evt) => {
+        isLocallyDragging = true;
         evt.item._originalParent = evt.from;
         evt.item._originalIndex = evt.oldIndex;
       },
 
       onEnd: async (evt) => {
+        isLocallyDragging = false;
+        flushQueuedEvents();
+
         const cardEl = evt.item;
         const fromListId = evt.from.dataset.listId;
         const toListId = evt.to.dataset.listId;
@@ -186,10 +200,14 @@ document.addEventListener('DOMContentLoaded', () => {
       ghostClass: 'sortable-column-ghost',
 
       onStart: (evt) => {
+        isLocallyDragging = true;
         evt.item._originalIndex = evt.oldIndex;
       },
 
       onEnd: async (evt) => {
+        isLocallyDragging = false;
+        flushQueuedEvents();
+
         const listEl = evt.item;
         const listId = listEl.dataset.listId;
         const newIndex = evt.newIndex;
@@ -219,12 +237,412 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function flushQueuedEvents() {
+    while (queuedEvents.length > 0) {
+      const eventData = queuedEvents.shift();
+      applyRemoteEvent(eventData);
+    }
+  }
+
   // Initialize existing card containers
   document.querySelectorAll('.column-cards-container').forEach(initCardsSortable);
   initColumnsSortable();
 
   // ===========================================================================
-  // 2. INLINE ADD LIST
+  // 2. REAL-TIME WEBSOCKET ENGINE (Phase 3)
+  // ===========================================================================
+
+  const wsStatusIndicator = document.getElementById('ws-status-indicator');
+  let socket = null;
+  let pingInterval = null;
+  let reconnectAttempts = 0;
+  let hasEverConnected = false;
+
+  function updateWsStatus(state, label) {
+    if (!wsStatusIndicator) return;
+    wsStatusIndicator.className = `ws-status-badge ws-status-${state}`;
+    const textEl = wsStatusIndicator.querySelector('.ws-status-text');
+    if (textEl) textEl.textContent = label;
+  }
+
+  function initWebSocket() {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/boards/${boardId}/`;
+
+    updateWsStatus('connecting', 'Connecting...');
+
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+
+    socket.onopen = async () => {
+      updateWsStatus('connected', 'Live Sync Active');
+      const wasReconnecting = hasEverConnected && reconnectAttempts > 0;
+      hasEverConnected = true;
+      reconnectAttempts = 0;
+
+      // Start periodic 25s ping keepalive
+      if (pingInterval) clearInterval(pingInterval);
+      pingInterval = setInterval(() => {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 25000);
+
+      // Reconnection reconciliation: fetch full board snapshot to restore state missed during outage
+      if (wasReconnecting) {
+        await refetchBoardSnapshot();
+      }
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'pong') return;
+
+        // Echo cancellation: ignore events originating from this specific tab
+        if (data.client_id && data.client_id === tabClientId) {
+          return;
+        }
+
+        // If local user is currently dragging an element, queue the event to avoid layout collisions
+        if (isLocallyDragging) {
+          queuedEvents.push(data);
+        } else {
+          applyRemoteEvent(data);
+        }
+      } catch (err) {
+        console.error('Failed to parse WebSocket message:', err);
+      }
+    };
+
+    socket.onerror = () => {
+      updateWsStatus('reconnecting', 'Reconnecting...');
+    };
+
+    socket.onclose = (event) => {
+      if (pingInterval) clearInterval(pingInterval);
+
+      // Handle server-directed close codes
+      if (event.code === 4401) {
+        window.location.href = `/accounts/login/?next=${encodeURIComponent(window.location.pathname)}`;
+        return;
+      }
+      if (event.code === 4403 || event.code === 4404) {
+        alert('Your access to this board has ended or the board was deleted.');
+        window.location.href = '/boards/';
+        return;
+      }
+
+      scheduleReconnect();
+    };
+  }
+
+  function scheduleReconnect() {
+    updateWsStatus('reconnecting', 'Reconnecting...');
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(1.6, reconnectAttempts), 15000);
+    setTimeout(() => {
+      initWebSocket();
+    }, delay);
+  }
+
+  // Refetch full board snapshot to reconcile state upon reconnecting
+  async function refetchBoardSnapshot() {
+    try {
+      const res = await fetch(`/boards/${boardId}/snapshot/`, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.ok || !data.board) return;
+
+      reconcileDomWithSnapshot(data.board);
+      showToast('Reconnected. Board synchronized.', 'success');
+    } catch (err) {
+      console.warn('Snapshot reconciliation failed:', err);
+    }
+  }
+
+  // Reconcile DOM with snapshot data
+  function reconcileDomWithSnapshot(boardData) {
+    // 1. Update role if changed
+    if (boardData.current_role) {
+      applyRoleUpdate(boardData.current_role);
+    }
+
+    // 2. Re-render columns and cards
+    const track = document.getElementById('kanban-track');
+    if (!track) return;
+
+    const addListCol = document.getElementById('add-list-column');
+
+    boardData.lists.forEach((colData) => {
+      let colEl = document.getElementById(`list-col-${colData.id}`);
+      if (!colEl) {
+        colEl = createColumnElement(colData);
+        if (addListCol) {
+          track.insertBefore(colEl, addListCol);
+        } else {
+          track.appendChild(colEl);
+        }
+        const container = colEl.querySelector('.column-cards-container');
+        initCardsSortable(container);
+      } else {
+        const titleText = document.getElementById(`list-title-text-${colData.id}`);
+        if (titleText) titleText.textContent = colData.title;
+      }
+
+      // Reconcile cards in this column
+      const cardsContainer = document.getElementById(`cards-container-${colData.id}`);
+      if (!cardsContainer) return;
+
+      cardsContainer.innerHTML = '';
+      colData.cards.forEach((cardData) => {
+        const cardEl = createCardElement(cardData);
+        cardsContainer.appendChild(cardEl);
+      });
+
+      updateColumnMetadata(colEl);
+    });
+  }
+
+  // ===========================================================================
+  // 3. APPLY REMOTE SERVER EVENTS (Live Real-Time DOM Updates)
+  // ===========================================================================
+
+  function applyRemoteEvent(data) {
+    const eventType = data.event;
+    const payload = data.payload || {};
+
+    switch (eventType) {
+      case 'list.created': {
+        const listData = payload.list;
+        if (!listData) return;
+        if (document.getElementById(`list-col-${listData.id}`)) return;
+
+        const newCol = createColumnElement(listData);
+        const addListCol = document.getElementById('add-list-column');
+        if (addListCol) {
+          addListCol.parentNode.insertBefore(newCol, addListCol);
+        } else {
+          document.getElementById('kanban-track').appendChild(newCol);
+        }
+
+        const newCardsContainer = newCol.querySelector('.column-cards-container');
+        initCardsSortable(newCardsContainer);
+        showToast(`Column '${listData.title}' added.`, 'info');
+        break;
+      }
+
+      case 'list.renamed': {
+        const listData = payload.list;
+        if (!listData) return;
+        const titleText = document.getElementById(`list-title-text-${listData.id}`);
+        const titleInput = document.getElementById(`list-title-input-${listData.id}`);
+        if (titleText) titleText.textContent = listData.title;
+        if (titleInput) titleInput.value = listData.title;
+        break;
+      }
+
+      case 'list.deleted': {
+        const listId = payload.list_id;
+        const colEl = document.getElementById(`list-col-${listId}`);
+        if (colEl) {
+          colEl.remove();
+          showToast('A column was deleted.', 'info');
+        }
+        break;
+      }
+
+      case 'list.moved': {
+        const listId = payload.list_id;
+        const newPosition = payload.new_position;
+        const track = document.getElementById('kanban-track');
+        const listEl = document.getElementById(`list-col-${listId}`);
+        if (!track || !listEl) return;
+
+        const columns = Array.from(track.querySelectorAll('.kanban-column')).filter(
+          (c) => c !== listEl
+        );
+
+        const addCol = document.getElementById('add-list-column');
+        if (newPosition >= columns.length) {
+          if (addCol) track.insertBefore(listEl, addCol);
+          else track.appendChild(listEl);
+        } else {
+          track.insertBefore(listEl, columns[newPosition]);
+        }
+        listEl.dataset.position = newPosition;
+        break;
+      }
+
+      case 'card.created': {
+        const cardData = payload.card;
+        if (!cardData) return;
+        if (document.getElementById(`card-${cardData.id}`)) return;
+
+        const container = document.getElementById(`cards-container-${cardData.list_id}`);
+        if (container) {
+          const cardEl = createCardElement(cardData);
+          container.appendChild(cardEl);
+          const colEl = document.getElementById(`list-col-${cardData.list_id}`);
+          updateColumnMetadata(colEl);
+        }
+        break;
+      }
+
+      case 'card.updated': {
+        const cardData = payload.card;
+        if (!cardData) return;
+        const cardEl = document.getElementById(`card-${cardData.id}`);
+        if (cardEl) {
+          cardEl.dataset.title = cardData.title;
+          cardEl.dataset.description = cardData.description || '';
+
+          const titleEl = cardEl.querySelector('.task-card-title');
+          if (titleEl) titleEl.textContent = cardData.title;
+
+          let descEl = cardEl.querySelector('.task-card-desc');
+          if (cardData.description) {
+            if (!descEl) {
+              descEl = document.createElement('div');
+              descEl.className = 'task-card-desc';
+              cardEl.querySelector('.task-card-footer').before(descEl);
+            }
+            descEl.textContent = cardData.description;
+          } else if (descEl) {
+            descEl.remove();
+          }
+        }
+
+        // Modal collision: If this card is currently open in modal, update live
+        const currentModalCardId = document.getElementById('modal-card-id');
+        if (currentModalCardId && currentModalCardId.value == cardData.id) {
+          const modalTitle = document.getElementById('modal-card-title');
+          const modalDesc = document.getElementById('modal-card-desc');
+          if (modalTitle) modalTitle.value = cardData.title;
+          if (modalDesc) modalDesc.value = cardData.description || '';
+          showToast('Card updated by a collaborator.', 'info');
+        }
+        break;
+      }
+
+      case 'card.deleted': {
+        const cardId = payload.card_id;
+        const listId = payload.list_id;
+        const cardEl = document.getElementById(`card-${cardId}`);
+        if (cardEl) {
+          const colEl = cardEl.closest('.kanban-column') || document.getElementById(`list-col-${listId}`);
+          cardEl.remove();
+          if (colEl) updateColumnMetadata(colEl);
+        }
+
+        // Modal collision: If this card is currently open in modal, close modal and warn
+        const currentModalCardId = document.getElementById('modal-card-id');
+        if (currentModalCardId && currentModalCardId.value == cardId) {
+          closeCardModal();
+          showToast('The card you were viewing was deleted by another user.', 'error');
+        }
+        break;
+      }
+
+      case 'card.moved': {
+        const { card_id, source_list_id, target_list_id, new_position } = payload;
+        const cardEl = document.getElementById(`card-${card_id}`);
+        const targetContainer = document.getElementById(`cards-container-${target_list_id}`);
+        if (!cardEl || !targetContainer) return;
+
+        const siblings = Array.from(targetContainer.querySelectorAll('.task-card')).filter(
+          (c) => c !== cardEl
+        );
+
+        if (new_position >= siblings.length) {
+          targetContainer.appendChild(cardEl);
+        } else {
+          targetContainer.insertBefore(cardEl, siblings[new_position]);
+        }
+
+        cardEl.dataset.listId = target_list_id;
+        cardEl.dataset.position = new_position;
+
+        const srcCol = document.getElementById(`list-col-${source_list_id}`);
+        const tgtCol = document.getElementById(`list-col-${target_list_id}`);
+        updateColumnMetadata(srcCol);
+        if (source_list_id !== target_list_id) {
+          updateColumnMetadata(tgtCol);
+        }
+        break;
+      }
+
+      case 'member.role_changed': {
+        const { user_id, new_role } = payload;
+        if (user_id === currentUserId) {
+          applyRoleUpdate(new_role);
+          showToast(`Your workspace role was updated to ${new_role}.`, 'info');
+        }
+        break;
+      }
+
+      case 'member.removed': {
+        const { user_id } = payload;
+        if (user_id === currentUserId) {
+          alert('You have been removed from this board workspace.');
+          window.location.href = '/boards/';
+        }
+        break;
+      }
+
+      case 'board.deleted': {
+        alert('This board has been deleted by its owner.');
+        window.location.href = '/boards/';
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  // Update permissions & UI dynamically when current user role changes live
+  function applyRoleUpdate(newRole) {
+    canEdit = (newRole === 'OWNER' || newRole === 'EDITOR');
+    boardApp.dataset.canEdit = canEdit ? 'true' : 'false';
+
+    const roleBadge = document.getElementById('user-role-badge');
+    if (roleBadge) {
+      roleBadge.className = `role-badge role-badge-${newRole.toLowerCase()}`;
+      roleBadge.textContent = `Your Role: ${newRole}`;
+    }
+
+    const readonlyIndicator = document.getElementById('readonly-indicator');
+    if (readonlyIndicator) {
+      readonlyIndicator.style.display = canEdit ? 'none' : 'inline-block';
+    }
+
+    // Toggle SortableJS drag permissions
+    cardSortables.forEach((s) => s.option('disabled', !canEdit));
+    if (columnSortable) columnSortable.option('disabled', !canEdit);
+
+    // Toggle add card buttons & forms
+    document.querySelectorAll('.btn-toggle-add-card, .list-drag-handle, .delete-list-btn').forEach((el) => {
+      el.style.display = canEdit ? '' : 'none';
+    });
+
+    const addListCol = document.getElementById('add-list-column');
+    if (addListCol) {
+      addListCol.style.display = canEdit ? 'block' : 'none';
+    }
+  }
+
+  // Start WebSocket client
+  initWebSocket();
+
+  // ===========================================================================
+  // 4. INLINE ADD LIST
   // ===========================================================================
 
   const btnShowAddList = document.getElementById('btn-show-add-list');
@@ -262,12 +680,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const data = await apiPost(`/boards/${boardId}/lists/create/`, { title });
         const newList = data.list;
 
-        // Render new column DOM
         const newCol = createColumnElement(newList);
         const addListCol = document.getElementById('add-list-column');
         addListCol.parentNode.insertBefore(newCol, addListCol);
 
-        // Initialize Sortable on the new column's card container
         const newCardsContainer = newCol.querySelector('.column-cards-container');
         initCardsSortable(newCardsContainer);
 
@@ -305,53 +721,49 @@ document.addEventListener('DOMContentLoaded', () => {
     col.innerHTML = `
       <div class="column-header">
         <div class="column-title-wrap">
-          ${canEdit ? '<span class="list-drag-handle" title="Drag to reorder column">⋮⋮</span>' : ''}
-          <span class="column-title-text" id="list-title-text-${list.id}" ${canEdit ? 'title="Click to rename list"' : ''}>${escapeHtml(list.title)}</span>
-          ${canEdit ? `<input type="text" class="column-title-input" id="list-title-input-${list.id}" value="${escapeHtml(list.title)}" style="display: none;" />` : ''}
+          <span class="list-drag-handle" title="Drag to reorder column" style="${canEdit ? '' : 'display: none;'}">⋮⋮</span>
+          <span class="column-title-text" id="list-title-text-${list.id}" title="Click to rename list">${escapeHtml(list.title)}</span>
+          <input type="text" class="column-title-input" id="list-title-input-${list.id}" value="${escapeHtml(list.title)}" style="display: none;" />
         </div>
         <div class="column-header-actions">
           <span class="column-count" id="list-count-${list.id}">0</span>
-          ${canEdit ? `
-            <button type="button" class="btn-icon btn-icon-danger delete-list-btn"
-                    data-list-id="${list.id}"
-                    data-list-title="${escapeHtml(list.title)}"
-                    data-card-count="0"
-                    title="Delete this list">
-              ✕
-            </button>
-          ` : ''}
+          <button type="button" class="btn-icon btn-icon-danger delete-list-btn"
+                  data-list-id="${list.id}"
+                  data-list-title="${escapeHtml(list.title)}"
+                  data-card-count="0"
+                  title="Delete this list"
+                  style="${canEdit ? '' : 'display: none;'}">
+            ✕
+          </button>
         </div>
       </div>
       <div class="column-cards-container" data-list-id="${list.id}" id="cards-container-${list.id}"></div>
-      ${canEdit ? `
-        <div class="add-card-section" id="add-card-section-${list.id}">
-          <button type="button" class="btn-toggle-add-card" id="btn-show-add-card-${list.id}" data-list-id="${list.id}">
-            + Add a card
-          </button>
-          <div class="add-card-form" id="add-card-form-${list.id}" style="display: none;">
-            <textarea class="add-card-input" id="add-card-title-${list.id}" placeholder="Enter a title for this card..." rows="2"></textarea>
-            <div class="add-card-actions">
-              <button type="button" class="btn btn-primary btn-sm btn-submit-add-card" data-list-id="${list.id}">
-                Add Card
-              </button>
-              <button type="button" class="btn btn-ghost btn-sm btn-cancel-add-card" data-list-id="${list.id}">
-                Cancel
-              </button>
-            </div>
+      <div class="add-card-section" id="add-card-section-${list.id}">
+        <button type="button" class="btn-toggle-add-card" id="btn-show-add-card-${list.id}" data-list-id="${list.id}" style="${canEdit ? '' : 'display: none;'}">
+          + Add a card
+        </button>
+        <div class="add-card-form" id="add-card-form-${list.id}" style="display: none;">
+          <textarea class="add-card-input" id="add-card-title-${list.id}" placeholder="Enter a title for this card..." rows="2"></textarea>
+          <div class="add-card-actions">
+            <button type="button" class="btn btn-primary btn-sm btn-submit-add-card" data-list-id="${list.id}">
+              Add Card
+            </button>
+            <button type="button" class="btn btn-ghost btn-sm btn-cancel-add-card" data-list-id="${list.id}">
+              Cancel
+            </button>
           </div>
         </div>
-      ` : ''}
+      </div>
     `;
 
     return col;
   }
 
   // ===========================================================================
-  // 3. INLINE ADD CARD (Delegated Event Listeners)
+  // 5. INLINE ADD CARD (Delegated Event Listeners)
   // ===========================================================================
 
   document.addEventListener('click', async (e) => {
-    // Show inline add card form
     const toggleBtn = e.target.closest('.btn-toggle-add-card');
     if (toggleBtn) {
       const listId = toggleBtn.dataset.listId;
@@ -365,7 +777,6 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Cancel inline add card form
     const cancelBtn = e.target.closest('.btn-cancel-add-card');
     if (cancelBtn) {
       const listId = cancelBtn.dataset.listId;
@@ -380,7 +791,6 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Submit inline add card form
     const submitBtn = e.target.closest('.btn-submit-add-card');
     if (submitBtn) {
       const listId = submitBtn.dataset.listId;
@@ -398,7 +808,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const data = await apiPost(`/boards/${boardId}/lists/${listId}/cards/create/`, { title });
         const newCard = data.card;
 
-        // Render and append card element
         const cardEl = createCardElement(newCard);
         const container = document.getElementById(`cards-container-${listId}`);
         if (container) {
@@ -418,7 +827,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Support Enter key submission inside add card textarea
   document.addEventListener('keydown', (e) => {
     if (e.target.matches('.add-card-input') && e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -464,7 +872,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ===========================================================================
-  // 4. INLINE LIST RENAMING
+  // 6. INLINE LIST RENAMING
   // ===========================================================================
 
   document.addEventListener('click', (e) => {
@@ -518,7 +926,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ===========================================================================
-  // 5. DELETE LIST CONFIRMATION MODAL
+  // 7. DELETE LIST CONFIRMATION MODAL
   // ===========================================================================
 
   const deleteListModal = document.getElementById('delete-list-modal');
@@ -582,7 +990,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ===========================================================================
-  // 6. CARD EDIT / DELETE MODAL
+  // 8. CARD EDIT / DELETE MODAL
   // ===========================================================================
 
   const cardModal = document.getElementById('card-modal');
@@ -636,9 +1044,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Open modal on card click
   document.addEventListener('click', (e) => {
-    // Ignore clicks on buttons or inside add forms
     if (e.target.closest('button') || e.target.closest('input') || e.target.closest('textarea')) {
       return;
     }
@@ -671,7 +1077,6 @@ document.addEventListener('DOMContentLoaded', () => {
           description,
         });
 
-        // Update card in DOM
         const cardEl = document.getElementById(`card-${cardId}`);
         if (cardEl) {
           cardEl.dataset.title = data.card.title;

@@ -1214,3 +1214,73 @@ a:hover {
   background-color: #1e293b;
   color: #f8fafc;
 }
+
+/* ==============================================================================
+   PHASE 3: Real-Time WebSocket Connection Indicator
+   ============================================================================== */
+
+.ws-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.ws-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* Connected State */
+.ws-status-connected {
+  background-color: #ecfdf5;
+  color: #065f46;
+  border-color: #a7f3d0;
+}
+.ws-status-connected .ws-status-dot {
+  background-color: #10b981;
+  box-shadow: 0 0 6px #10b981;
+}
+
+/* Connecting / Reconnecting State */
+.ws-status-connecting,
+.ws-status-reconnecting {
+  background-color: #fffbeb;
+  color: #92400e;
+  border-color: #fde68a;
+}
+.ws-status-connecting .ws-status-dot,
+.ws-status-reconnecting .ws-status-dot {
+  background-color: #f59e0b;
+  animation: pulseDot 1.2s infinite ease-in-out;
+}
+
+/* Disconnected State */
+.ws-status-disconnected {
+  background-color: #fef2f2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+.ws-status-disconnected .ws-status-dot {
+  background-color: #ef4444;
+}
+
+@keyframes pulseDot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.75);
+  }
+}
+

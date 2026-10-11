@@ -5,6 +5,7 @@ Configured with python-decouple for environment management and
 PostgreSQL as the primary database backend.
 """
 
+import sys
 from pathlib import Path
 from decouple import config, Csv
 
@@ -18,6 +19,8 @@ ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='127.0.0.1,localhost', cast=Csv(
 
 # Application definition
 INSTALLED_APPS = [
+    # Daphne must be listed before django.contrib.staticfiles for runserver integration
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -25,6 +28,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     
+    # Third-party apps
+    'channels',
+
     # Local apps
     'accounts.apps.AccountsConfig',
     'boards.apps.BoardsConfig',
@@ -59,6 +65,27 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'taskflow.wsgi.application'
+ASGI_APPLICATION = 'taskflow.asgi.application'
+
+# Channel Layer Configuration (Redis by default, InMemoryChannelLayer fallback)
+USE_IN_MEMORY_CHANNEL_LAYER = config('USE_IN_MEMORY_CHANNEL_LAYER', default=False, cast=bool)
+REDIS_URL = config('REDIS_URL', default='redis://127.0.0.1:6379/1')
+
+if USE_IN_MEMORY_CHANNEL_LAYER or 'test' in sys.argv:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer"
+        }
+    }
+else:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_URL],
+            },
+        },
+    }
 
 # Database
 # Default: PostgreSQL with psycopg. Fallback to SQLite if USE_SQLITE=True

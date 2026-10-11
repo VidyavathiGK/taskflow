@@ -1,5 +1,5 @@
 """
-Views for Board workspace CRUD, Member management, and Phase 2 JSON API endpoints.
+Views for Board workspace CRUD, Member management, and Phase 2 & 3 JSON API endpoints.
 """
 
 import json
@@ -78,7 +78,6 @@ class BoardDetailView(BoardAccessMixin, View):
     template_name = "boards/board_detail.html"
 
     def get(self, request, board_id):
-        # Fetch columns and nested cards with prefetch to avoid N+1 queries
         lists = (
             self.board.lists.prefetch_related(
                 "cards",
@@ -131,6 +130,7 @@ class BoardUpdateView(BoardOwnerRequiredMixin, View):
 class BoardDeleteView(BoardOwnerRequiredMixin, View):
     """
     Allows the board OWNER to delete the board and all associated resources.
+    Broadcasts 'board.deleted' to disconnect active WebSockets before deletion.
     """
     template_name = "boards/board_confirm_delete.html"
 
@@ -139,7 +139,7 @@ class BoardDeleteView(BoardOwnerRequiredMixin, View):
 
     def post(self, request, board_id):
         title = self.board.title
-        self.board.delete()
+        services.delete_board(self.board, request.user)
         messages.success(request, f"Board '{title}' has been deleted.")
         return redirect("boards:my_boards")
 
@@ -199,18 +199,14 @@ class BoardMembersView(BoardOwnerRequiredMixin, View):
                 board=self.board
             )
 
-            # Safety check: Owner cannot be demoted
-            if membership.user == self.board.owner or membership.role == BoardMembership.Role.OWNER:
-                messages.error(request, "The board OWNER cannot be demoted or have their role changed.")
-            elif new_role in [BoardMembership.Role.EDITOR, BoardMembership.Role.VIEWER]:
-                membership.role = new_role
-                membership.save()
+            try:
+                services.change_member_role(self.board, membership, new_role, request.user)
                 messages.success(
                     request,
                     f"Updated role for @{membership.user.username} to {new_role}."
                 )
-            else:
-                messages.error(request, "Invalid role specified.")
+            except ValueError as e:
+                messages.error(request, str(e))
             return redirect("boards:manage_members", board_id=self.board.id)
 
         # Action 3: Remove an existing member
@@ -222,13 +218,12 @@ class BoardMembersView(BoardOwnerRequiredMixin, View):
                 board=self.board
             )
 
-            # Safety check: Owner cannot be removed
-            if membership.user == self.board.owner or membership.role == BoardMembership.Role.OWNER:
-                messages.error(request, "The board OWNER cannot be removed from the board.")
-            else:
-                username = membership.user.username
-                membership.delete()
+            username = membership.user.username
+            try:
+                services.remove_member(self.board, membership, request.user)
                 messages.success(request, f"Removed @{username} from the board.")
+            except ValueError as e:
+                messages.error(request, str(e))
             return redirect("boards:manage_members", board_id=self.board.id)
 
         messages.error(request, "Unknown action requested.")
@@ -236,16 +231,17 @@ class BoardMembersView(BoardOwnerRequiredMixin, View):
 
 
 # ==============================================================================
-# PHASE 2: JSON API BASE & MUTATION ENDPOINTS
+# PHASE 2 & 3: JSON API BASE & MUTATION ENDPOINTS
 # ==============================================================================
 
 class BoardApiView(BoardAccessMixin, View):
     """
-    Base view for Phase 2 JSON API endpoints.
+    Base view for Phase 2 & 3 JSON API endpoints.
     Reuses Phase 1 BoardAccessMixin:
     - Non-members automatically get 404 Http404 (preventing workspace enumeration).
     - Unauthenticated requests are rejected.
     - Captures domain and permission exceptions, converting them into standard JSON responses.
+    - Extracts X-Client-ID header for client-side echo cancellation.
     """
 
     def parse_payload(self, request):
@@ -259,6 +255,15 @@ class BoardApiView(BoardAccessMixin, View):
                 return None
         return request.POST
 
+    def get_client_id(self, request, payload):
+        """Extract client tab identifier from X-Client-ID header or JSON payload."""
+        header_id = request.headers.get("X-Client-ID")
+        if header_id:
+            return header_id
+        if isinstance(payload, dict):
+            return payload.get("client_id")
+        return None
+
     def dispatch(self, request, *args, **kwargs):
         if request.method != "POST":
             return JsonResponse({"ok": False, "error": "Method not allowed. Use POST."}, status=405)
@@ -271,6 +276,52 @@ class BoardApiView(BoardAccessMixin, View):
             return JsonResponse({"ok": False, "error": str(e)}, status=400)
 
 
+class BoardSnapshotApiView(BoardAccessMixin, View):
+    """
+    GET /boards/<board_id>/snapshot/
+    Returns serialized state of the entire board (lists, cards, current member role).
+    Used by clients upon WebSocket reconnection to reconcile DOM without full reload.
+    """
+    def get(self, request, board_id):
+        lists = (
+            self.board.lists.prefetch_related("cards", "cards__created_by")
+            .order_by("position", "created_at")
+        )
+
+        lists_data = []
+        for lst in lists:
+            cards_data = [
+                {
+                    "id": card.id,
+                    "title": card.title,
+                    "description": card.description,
+                    "position": card.position,
+                    "list_id": card.board_list_id,
+                    "author": card.created_by.username,
+                    "author_initials": card.created_by.initials,
+                    "author_color": getattr(card.created_by, "avatar_color", "#4F46E5"),
+                }
+                for card in lst.cards.all()
+            ]
+            lists_data.append({
+                "id": lst.id,
+                "title": lst.title,
+                "position": lst.position,
+                "cards": cards_data,
+            })
+
+        return JsonResponse({
+            "ok": True,
+            "board": {
+                "id": self.board.id,
+                "title": self.board.title,
+                "current_role": self.membership.role,
+                "can_edit": self.membership.role in [BoardMembership.Role.OWNER, BoardMembership.Role.EDITOR],
+                "lists": lists_data,
+            }
+        })
+
+
 class ListCreateApiView(BoardApiView):
     """POST /boards/<board_id>/lists/create/"""
     def post(self, request, board_id):
@@ -279,7 +330,8 @@ class ListCreateApiView(BoardApiView):
             return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
 
         title = payload.get("title")
-        new_list = services.create_list(self.board, title, request.user)
+        client_id = self.get_client_id(request, payload)
+        new_list = services.create_list(self.board, title, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "list": {
@@ -299,7 +351,8 @@ class ListRenameApiView(BoardApiView):
             return JsonResponse({"ok": False, "error": "Invalid JSON payload."}, status=400)
 
         title = payload.get("title")
-        updated_list = services.rename_list(board_list, title, request.user)
+        client_id = self.get_client_id(request, payload)
+        updated_list = services.rename_list(board_list, title, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "list": {
@@ -314,7 +367,9 @@ class ListDeleteApiView(BoardApiView):
     """POST /boards/<board_id>/lists/<list_id>/delete/"""
     def post(self, request, board_id, list_id):
         board_list = get_object_or_404(BoardList, id=list_id, board=self.board)
-        services.delete_list(board_list, request.user)
+        payload = self.parse_payload(request)
+        client_id = self.get_client_id(request, payload) if payload else None
+        services.delete_list(board_list, request.user, client_id=client_id)
         return JsonResponse({"ok": True})
 
 
@@ -335,7 +390,8 @@ class ListMoveApiView(BoardApiView):
         except (ValueError, TypeError):
             return JsonResponse({"ok": False, "error": "'new_position' must be an integer."}, status=400)
 
-        moved_list = services.move_list(board_list, new_position_int, request.user)
+        client_id = self.get_client_id(request, payload)
+        moved_list = services.move_list(board_list, new_position_int, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "list": {
@@ -355,7 +411,8 @@ class CardCreateApiView(BoardApiView):
 
         title = payload.get("title")
         description = payload.get("description", "")
-        card = services.create_card(board_list, title, description, request.user)
+        client_id = self.get_client_id(request, payload)
+        card = services.create_card(board_list, title, description, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "card": {
@@ -381,7 +438,8 @@ class CardUpdateApiView(BoardApiView):
 
         title = payload.get("title")
         description = payload.get("description")
-        updated_card = services.update_card(card, title, description, request.user)
+        client_id = self.get_client_id(request, payload)
+        updated_card = services.update_card(card, title, description, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "card": {
@@ -398,7 +456,9 @@ class CardDeleteApiView(BoardApiView):
     """POST /boards/<board_id>/cards/<card_id>/delete/"""
     def post(self, request, board_id, card_id):
         card = get_object_or_404(Card, id=card_id, board_list__board=self.board)
-        services.delete_card(card, request.user)
+        payload = self.parse_payload(request)
+        client_id = self.get_client_id(request, payload) if payload else None
+        services.delete_card(card, request.user, client_id=client_id)
         return JsonResponse({"ok": True})
 
 
@@ -427,7 +487,8 @@ class CardMoveApiView(BoardApiView):
         # Enforce target list belongs to the same board workspace (returns 404 otherwise)
         target_list = get_object_or_404(BoardList, id=target_list_id, board=self.board)
 
-        moved_card = services.move_card(card, target_list, new_position_int, request.user)
+        client_id = self.get_client_id(request, payload)
+        moved_card = services.move_card(card, target_list, new_position_int, request.user, client_id=client_id)
         return JsonResponse({
             "ok": True,
             "card": {

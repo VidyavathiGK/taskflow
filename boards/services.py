@@ -4,52 +4,44 @@ Business logic service layer for TaskFlow board mutations.
 Contains state-changing operations for lists and cards:
 - create_list, rename_list, delete_list, move_list
 - create_card, update_card, delete_card, move_card
+- change_member_role, remove_member, delete_board
 
-ARCHITECTURAL RATIONALE & ORDERING STRATEGY TRADEOFF ANALYSIS:
+ARCHITECTURAL RATIONALE & PHASE 3 BROADCAST INTEGRATION:
 -----------------------------------------------------------------------------
 1. WHY A DEDICATED SERVICE LAYER?
    Views act purely as thin HTTP/JSON adapters, delegating all domain logic and
    validation to this module. This design guarantees consistent validation across
-   standard HTTP requests, AJAX endpoints, management commands, and future
-   WebSocket consumers in Phase 3. Each function returns the updated domain
-   entity, enabling Phase 3 event channels to broadcast mutations seamlessly.
+   standard HTTP requests, AJAX endpoints, management commands, and WebSocket
+   broadcasts.
 
-2. CONTIGUOUS INTEGER ORDERING (0, 1, 2, ... N-1) VS. ALTERNATIVES:
-   - Contiguous Integer Renumbering (Selected):
-     * How it works: Items have consecutive integer positions. When an item is
-       moved or deleted, the gap is closed, the item is inserted at the destination,
-       and affected rows are renumbered (0, 1, 2...).
-     * Benefits: Completely deterministic, human-readable, zero risk of
-       floating-point precision exhaustion (e.g. 0.0000000000001 underflow in
-       fractional indexing), and requires no background rebalancing jobs.
-     * Tradeoff: Moves require O(N) database updates for items in the affected
-       column. However, in Kanban workflows where a column rarely exceeds 50-100
-       cards, an indexed batch update executes in <5ms.
-   - Fractional / Float Indexing (Rejected for Phase 2):
-     * Generates midpoints (e.g. (pos_a + pos_b) / 2). Avoids multi-row writes
-       initially, but rapidly collapses due to IEEE 754 precision limits when
-       items are repeatedly dropped into the same slot, requiring complex
-       rebalancing algorithms.
-   - LexoRank / String Keys (Rejected for Phase 2):
-     * Avoids multi-row writes by interleaving alphanumeric strings (e.g. '0|aaaaa:'),
-       but introduces string storage bloat, rebalancing logic, and query complexity.
+2. ONE VALIDATED WRITE PATH (CQRS PATTERN):
+   All mutations flow strictly through HTTP endpoints -> services.py -> database.
+   WebSockets are used ONLY to push real-time event notifications to clients.
+   This guarantees that validation, permissions, and transaction locks remain
+   centralized in one hardened code path.
 
-3. CONCURRENCY & RACE CONDITIONS:
-   Multi-row renumbering is wrapped in `transaction.atomic()` with `select_for_update()`.
-   This locks the rows of the affected board or list, preventing two concurrent drags
-   from producing duplicate positions or corrupted sequences.
+3. TRANSACTION ON_COMMIT BROADCASTING:
+   All events.broadcast() calls are wrapped in transaction.on_commit().
+   This guarantees that if an exception triggers a database rollback, clients
+   will never receive ghost events for mutations that failed to persist.
+
+4. CONTIGUOUS INTEGER ORDERING (0, 1, 2, ... N-1):
+   - Items maintain strictly consecutive integer positions. When an item is moved
+     or deleted, the gap is closed, the item is inserted at the destination, and
+     neighboring rows are renumbered sequentially.
+   - Concurrency is protected using transaction.atomic() with select_for_update().
 """
 
 from typing import Optional
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.db.models import QuerySet
 
 from .models import Board, BoardList, BoardMembership, Card
+from . import events
 
 
 # ==============================================================================
-# PERMISSION VALIDATION HELPER
+# PERMISSION VALIDATION HELPERS
 # ==============================================================================
 
 def validate_editor_or_owner(board: Board, user) -> BoardMembership:
@@ -66,7 +58,6 @@ def validate_editor_or_owner(board: Board, user) -> BoardMembership:
     try:
         membership = BoardMembership.objects.get(board=board, user=user)
     except BoardMembership.DoesNotExist:
-        # User is not a member of this board
         raise PermissionDenied("You are not a member of this board.")
 
     if membership.role not in [BoardMembership.Role.OWNER, BoardMembership.Role.EDITOR]:
@@ -75,21 +66,30 @@ def validate_editor_or_owner(board: Board, user) -> BoardMembership:
     return membership
 
 
+def validate_owner(board: Board, user) -> BoardMembership:
+    """Ensure the user is the board OWNER."""
+    if not user or not user.is_authenticated:
+        raise PermissionDenied("Authentication required.")
+
+    try:
+        membership = BoardMembership.objects.get(board=board, user=user)
+    except BoardMembership.DoesNotExist:
+        raise PermissionDenied("You are not a member of this board.")
+
+    if membership.role != BoardMembership.Role.OWNER:
+        raise PermissionDenied("Only the board OWNER can perform this action.")
+
+    return membership
+
+
 # ==============================================================================
 # BOARD LIST SERVICES
 # ==============================================================================
 
-def create_list(board: Board, title: str, user) -> BoardList:
+def create_list(board: Board, title: str, user, client_id: Optional[str] = None) -> BoardList:
     """
     Create a new BoardList appended at the end of the board.
-
-    Args:
-        board: Target board workspace.
-        title: Title of the new column.
-        user: Acting user performing the action.
-
-    Returns:
-        The newly created BoardList instance.
+    Broadcasts 'list.created' on database commit.
     """
     validate_editor_or_owner(board, user)
 
@@ -98,7 +98,6 @@ def create_list(board: Board, title: str, user) -> BoardList:
         raise ValueError("List title cannot be empty.")
 
     with transaction.atomic():
-        # Lock existing lists on the board to avoid race condition on position assignment
         existing_lists = BoardList.objects.filter(board=board).select_for_update()
         position = existing_lists.count()
 
@@ -108,20 +107,28 @@ def create_list(board: Board, title: str, user) -> BoardList:
             position=position,
         )
 
+        list_data = {
+            "id": new_list.id,
+            "title": new_list.title,
+            "position": new_list.position,
+        }
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board.id,
+                event_type="list.created",
+                payload={"list": list_data},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
+
     return new_list
 
 
-def rename_list(board_list: BoardList, new_title: str, user) -> BoardList:
+def rename_list(board_list: BoardList, new_title: str, user, client_id: Optional[str] = None) -> BoardList:
     """
     Rename an existing BoardList column.
-
-    Args:
-        board_list: The BoardList instance to rename.
-        new_title: The updated column title.
-        user: Acting user performing the action.
-
-    Returns:
-        The updated BoardList instance.
+    Broadcasts 'list.renamed' on database commit.
     """
     validate_editor_or_owner(board_list.board, user)
 
@@ -129,25 +136,38 @@ def rename_list(board_list: BoardList, new_title: str, user) -> BoardList:
     if not clean_title:
         raise ValueError("List title cannot be empty.")
 
-    board_list.title = clean_title
-    board_list.save(update_fields=["title"])
+    with transaction.atomic():
+        board_list.title = clean_title
+        board_list.save(update_fields=["title"])
+
+        list_data = {
+            "id": board_list.id,
+            "title": board_list.title,
+        }
+        board_id = board_list.board_id
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="list.renamed",
+                payload={"list": list_data},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
+
     return board_list
 
 
-def delete_list(board_list: BoardList, user) -> None:
+def delete_list(board_list: BoardList, user, client_id: Optional[str] = None) -> None:
     """
     Delete a BoardList (and all cards inside it), renumbering remaining lists
     to maintain contiguous zero-indexed positions.
-
-    Args:
-        board_list: The BoardList instance to delete.
-        user: Acting user performing the action.
+    Broadcasts 'list.deleted' on database commit.
     """
     board = board_list.board
     validate_editor_or_owner(board, user)
 
     with transaction.atomic():
-        # Lock all lists for this board
         all_lists = list(
             BoardList.objects.filter(board=board)
             .select_for_update()
@@ -164,37 +184,38 @@ def delete_list(board_list: BoardList, user) -> None:
                 lst.position = idx
                 lst.save(update_fields=["position"])
 
+        board_id = board.id
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="list.deleted",
+                payload={"list_id": deleted_id},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
 
-def move_list(board_list: BoardList, new_position: int, user) -> BoardList:
+
+def move_list(board_list: BoardList, new_position: int, user, client_id: Optional[str] = None) -> BoardList:
     """
     Reorder a BoardList column within its board to a new zero-based index.
     Renumbers all sibling lists to guarantee strictly contiguous ordering.
-
-    Args:
-        board_list: The BoardList instance to reposition.
-        new_position: The desired target index (0-indexed).
-        user: Acting user performing the action.
-
-    Returns:
-        The updated BoardList instance with its new position.
+    Broadcasts 'list.moved' on database commit.
     """
     board = board_list.board
     validate_editor_or_owner(board, user)
 
     with transaction.atomic():
-        # Lock all lists belonging to this board
         lists = list(
             BoardList.objects.filter(board=board)
             .select_for_update()
             .order_by("position", "created_at")
         )
 
-        # Locate the item in the locked queryset
         current_index = next((i for i, lst in enumerate(lists) if lst.id == board_list.id), None)
         if current_index is None:
             raise ValueError("List not found on the specified board.")
 
-        # Clamp new_position within bounds [0, len(lists) - 1]
         clamped_position = max(0, min(int(new_position), len(lists) - 1))
 
         if current_index != clamped_position:
@@ -207,6 +228,18 @@ def move_list(board_list: BoardList, new_position: int, user) -> BoardList:
                     lst.save(update_fields=["position"])
 
         board_list.position = clamped_position
+        list_id = board_list.id
+        board_id = board.id
+
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="list.moved",
+                payload={"list_id": list_id, "new_position": clamped_position},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
 
     return board_list
 
@@ -215,18 +248,16 @@ def move_list(board_list: BoardList, new_position: int, user) -> BoardList:
 # CARD SERVICES
 # ==============================================================================
 
-def create_card(board_list: BoardList, title: str, description: str, user) -> Card:
+def create_card(
+    board_list: BoardList,
+    title: str,
+    description: str,
+    user,
+    client_id: Optional[str] = None
+) -> Card:
     """
     Create a new Card appended at the bottom of the given list.
-
-    Args:
-        board_list: The column container for the new card.
-        title: Title of the task card.
-        description: Optional details or acceptance criteria.
-        user: Acting user (saved as created_by author).
-
-    Returns:
-        The newly created Card instance.
+    Broadcasts 'card.created' on database commit.
     """
     validate_editor_or_owner(board_list.board, user)
 
@@ -237,7 +268,6 @@ def create_card(board_list: BoardList, title: str, description: str, user) -> Ca
     clean_desc = (description or "").strip()
 
     with transaction.atomic():
-        # Lock cards in this list to accurately compute the next position
         existing_cards = Card.objects.filter(board_list=board_list).select_for_update()
         position = existing_cards.count()
 
@@ -249,21 +279,41 @@ def create_card(board_list: BoardList, title: str, description: str, user) -> Ca
             created_by=user,
         )
 
+        card_data = {
+            "id": card.id,
+            "title": card.title,
+            "description": card.description,
+            "position": card.position,
+            "list_id": card.board_list_id,
+            "author": user.username,
+            "author_initials": user.initials,
+            "author_color": getattr(user, "avatar_color", "#4F46E5"),
+        }
+        board_id = board_list.board_id
+
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="card.created",
+                payload={"card": card_data},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
+
     return card
 
 
-def update_card(card: Card, title: str, description: Optional[str], user) -> Card:
+def update_card(
+    card: Card,
+    title: str,
+    description: Optional[str],
+    user,
+    client_id: Optional[str] = None
+) -> Card:
     """
     Update a Card's title and/or description.
-
-    Args:
-        card: The Card instance to edit.
-        title: Updated task title.
-        description: Updated description body.
-        user: Acting user performing the action.
-
-    Returns:
-        The updated Card instance.
+    Broadcasts 'card.updated' on database commit.
     """
     validate_editor_or_owner(card.board_list.board, user)
 
@@ -271,21 +321,38 @@ def update_card(card: Card, title: str, description: Optional[str], user) -> Car
     if not clean_title:
         raise ValueError("Card title cannot be empty.")
 
-    card.title = clean_title
-    if description is not None:
-        card.description = description.strip()
+    with transaction.atomic():
+        card.title = clean_title
+        if description is not None:
+            card.description = description.strip()
 
-    card.save(update_fields=["title", "description", "updated_at"])
+        card.save(update_fields=["title", "description", "updated_at"])
+
+        card_data = {
+            "id": card.id,
+            "title": card.title,
+            "description": card.description,
+            "list_id": card.board_list_id,
+        }
+        board_id = card.board_list.board_id
+
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="card.updated",
+                payload={"card": card_data},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
+
     return card
 
 
-def delete_card(card: Card, user) -> None:
+def delete_card(card: Card, user, client_id: Optional[str] = None) -> None:
     """
     Delete a Card and renumber remaining cards in its parent list to close the gap.
-
-    Args:
-        card: The Card instance to delete.
-        user: Acting user performing the action.
+    Broadcasts 'card.deleted' on database commit.
     """
     board_list = card.board_list
     validate_editor_or_owner(board_list.board, user)
@@ -300,30 +367,37 @@ def delete_card(card: Card, user) -> None:
         deleted_id = card.id
         card.delete()
 
-        # Renumber remaining cards contiguous
         remaining = [c for c in all_cards if c.id != deleted_id]
         for idx, c in enumerate(remaining):
             if c.position != idx:
                 c.position = idx
                 c.save(update_fields=["position"])
 
+        board_id = board_list.board_id
+        list_id = board_list.id
 
-def move_card(card: Card, target_list: BoardList, new_position: int, user) -> Card:
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="card.deleted",
+                payload={"card_id": deleted_id, "list_id": list_id},
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
+
+
+def move_card(
+    card: Card,
+    target_list: BoardList,
+    new_position: int,
+    user,
+    client_id: Optional[str] = None
+) -> Card:
     """
     Move a Card to a new position, either within the same list or across lists.
-
-    SECURITY INVARIANT:
-    Ensures both source list and target list belong to the EXACT same board.
-    Cross-board card injection is strictly rejected.
-
-    Args:
-        card: The Card instance being repositioned.
-        target_list: The destination BoardList column.
-        new_position: The desired target index (0-indexed).
-        user: Acting user performing the action.
-
-    Returns:
-        The updated Card instance with its new list and position.
+    Validates cross-board isolation, locks affected rows, and renumbers contiguously.
+    Broadcasts 'card.moved' on database commit.
     """
     source_list = card.board_list
     board = source_list.board
@@ -334,7 +408,10 @@ def move_card(card: Card, target_list: BoardList, new_position: int, user) -> Ca
         raise ValueError("Target list does not belong to the same board.")
 
     with transaction.atomic():
-        if source_list.id == target_list.id:
+        source_id = source_list.id
+        target_id = target_list.id
+
+        if source_id == target_id:
             # Moving within the same list
             cards = list(
                 Card.objects.filter(board_list=source_list)
@@ -383,7 +460,6 @@ def move_card(card: Card, target_list: BoardList, new_position: int, user) -> Ca
             clamped_position = max(0, min(int(new_position), len(target_cards)))
             target_cards.insert(clamped_position, card)
 
-            # Update the card's foreign key and position
             card.board_list = target_list
             card.position = clamped_position
             card.save(update_fields=["board_list", "position", "updated_at"])
@@ -395,5 +471,130 @@ def move_card(card: Card, target_list: BoardList, new_position: int, user) -> Ca
                     c.save(update_fields=["position"])
 
         card.refresh_from_db()
+        card_id = card.id
+        final_pos = card.position
+        board_id = board.id
+
+        transaction.on_commit(
+            lambda: events.broadcast(
+                board_id=board_id,
+                event_type="card.moved",
+                payload={
+                    "card_id": card_id,
+                    "source_list_id": source_id,
+                    "target_list_id": target_id,
+                    "new_position": final_pos,
+                },
+                actor_id=user.id,
+                client_id=client_id,
+            )
+        )
 
     return card
+
+
+# ==============================================================================
+# MEMBERSHIP & BOARD LIFECYCLE SERVICES (Phase 3 Real-time Events)
+# ==============================================================================
+
+def change_member_role(
+    board: Board,
+    membership: BoardMembership,
+    new_role: str,
+    user,
+    client_id: Optional[str] = None
+) -> BoardMembership:
+    """
+    Change a member's role.
+    Pushes 'member.role_changed' to both the board group and targeted user group.
+    """
+    validate_owner(board, user)
+
+    if membership.user == board.owner or membership.role == BoardMembership.Role.OWNER:
+        raise ValueError("The board OWNER cannot be demoted.")
+
+    if new_role not in [BoardMembership.Role.EDITOR, BoardMembership.Role.VIEWER]:
+        raise ValueError("Invalid role specified.")
+
+    with transaction.atomic():
+        membership.role = new_role
+        membership.save(update_fields=["role"])
+
+        user_id = membership.user_id
+        board_id = board.id
+
+        transaction.on_commit(
+            lambda: (
+                events.broadcast(
+                    board_id=board_id,
+                    event_type="member.role_changed",
+                    payload={"user_id": user_id, "new_role": new_role},
+                    actor_id=user.id,
+                    client_id=client_id,
+                ),
+                events.send_user_event(
+                    user_id=user_id,
+                    event_type="member.role_changed",
+                    payload={"user_id": user_id, "new_role": new_role, "board_id": board_id},
+                )
+            )
+        )
+
+    return membership
+
+
+def remove_member(
+    board: Board,
+    membership: BoardMembership,
+    user,
+    client_id: Optional[str] = None
+) -> None:
+    """
+    Remove a member from the board.
+    Pushes 'member.removed' to both board and user channels.
+    """
+    validate_owner(board, user)
+
+    if membership.user == board.owner or membership.role == BoardMembership.Role.OWNER:
+        raise ValueError("The board OWNER cannot be removed.")
+
+    with transaction.atomic():
+        user_id = membership.user_id
+        board_id = board.id
+        membership.delete()
+
+        transaction.on_commit(
+            lambda: (
+                events.broadcast(
+                    board_id=board_id,
+                    event_type="member.removed",
+                    payload={"user_id": user_id},
+                    actor_id=user.id,
+                    client_id=client_id,
+                ),
+                events.send_user_event(
+                    user_id=user_id,
+                    event_type="member.removed",
+                    payload={"user_id": user_id, "board_id": board_id},
+                )
+            )
+        )
+
+
+def delete_board(board: Board, user, client_id: Optional[str] = None) -> None:
+    """
+    Delete a board and all associated resources.
+    Broadcasts 'board.deleted' to kick connected users before deletion.
+    """
+    validate_owner(board, user)
+
+    board_id = board.id
+    # Broadcast immediately before database cascade
+    events.broadcast(
+        board_id=board_id,
+        event_type="board.deleted",
+        payload={"board_id": board_id},
+        actor_id=user.id,
+        client_id=client_id,
+    )
+    board.delete()

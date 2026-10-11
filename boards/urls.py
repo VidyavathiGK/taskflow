@@ -4,6 +4,7 @@ from .views import (
     BoardDeleteView,
     BoardDetailView,
     BoardMembersView,
+    BoardSnapshotApiView,
     BoardUpdateView,
     CardCreateApiView,
     CardDeleteApiView,
@@ -26,6 +27,9 @@ urlpatterns = [
     path("<int:board_id>/edit/", BoardUpdateView.as_view(), name="board_edit"),
     path("<int:board_id>/delete/", BoardDeleteView.as_view(), name="board_delete"),
     path("<int:board_id>/members/", BoardMembersView.as_view(), name="manage_members"),
+
+    # Phase 3 Reconnection Snapshot Endpoint
+    path("<int:board_id>/snapshot/", BoardSnapshotApiView.as_view(), name="api_board_snapshot"),
 
     # Phase 2 JSON API Endpoints (POST only)
     # List Endpoints
