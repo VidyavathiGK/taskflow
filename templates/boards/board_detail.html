@@ -31,14 +31,27 @@
           <span class="readonly-pill" id="readonly-indicator" style="{% if can_edit %}display: none;{% endif %}">
             🔒 Read-Only
           </span>
+
+          <!-- Phase 4 Live Presence Viewing Avatars -->
+          <div class="board-presence-wrap" id="board-presence-wrap">
+            <span class="presence-label">Viewing now:</span>
+            <div class="presence-avatars-group" id="board-presence-container">
+              <!-- Rendered via Redis sorted set presence -->
+            </div>
+          </div>
         </div>
         {% if board.description %}
           <p class="board-desc-main">{{ board.description }}</p>
         {% endif %}
       </div>
 
-      <!-- Actions restricted strictly to Board OWNER -->
+      <!-- Actions -->
       <div class="board-actions">
+        <!-- Phase 4 Activity Panel Toggle -->
+        <button type="button" class="btn btn-secondary btn-sm" id="activity-panel-toggle" title="View board activity audit log">
+          📜 Activity
+        </button>
+
         {% if is_owner %}
           <a href="{% url 'boards:manage_members' board_id=board.id %}" class="btn btn-secondary btn-sm">
             👥 Manage Members
@@ -56,7 +69,7 @@
     <!-- Members Roster -->
     <div class="board-meta-bar">
       <div class="board-members-roster">
-        <span class="members-label">Members ({{ memberships.count }}):</span>
+        <span class="members-label">Members ({{ memberships|length }}):</span>
         {% for m in memberships %}
           <div class="member-chip" title="@{{ m.user.username }} - {{ m.role }}">
             <span class="avatar-bubble avatar-bubble-sm" style="background-color: {{ m.user.avatar_color|default:'#4F46E5' }};">
@@ -106,13 +119,13 @@
             </div>
 
             <div class="column-header-actions">
-              <span class="column-count" id="list-count-{{ col.id }}">{{ col.cards.count }}</span>
+              <span class="column-count" id="list-count-{{ col.id }}">{{ col.cards.all|length }}</span>
               {% if can_edit %}
                 <button type="button"
                         class="btn-icon btn-icon-danger delete-list-btn"
                         data-list-id="{{ col.id }}"
                         data-list-title="{{ col.title }}"
-                        data-card-count="{{ col.cards.count }}"
+                        data-card-count="{{ col.cards.all|length }}"
                         title="Delete this list">
                   ✕
                 </button>
@@ -134,6 +147,11 @@
                    data-author="{{ card.created_by.username }}"
                    data-author-initials="{{ card.created_by.initials }}"
                    data-author-color="{{ card.created_by.avatar_color|default:'#4F46E5' }}"
+                   data-assignee-id="{{ card.assignee_id|default:'' }}"
+                   data-assignee-username="{{ card.assignee.username|default:'' }}"
+                   data-assignee-initials="{{ card.assignee.initials|default:'' }}"
+                   data-assignee-color="{{ card.assignee.avatar_color|default:'#64748B' }}"
+                   data-comments-count="{{ card.comments_count|default:0 }}"
                    id="card-{{ card.id }}">
                 <div class="task-card-title">{{ card.title }}</div>
                 {% if card.description %}
@@ -142,12 +160,34 @@
                 <div class="task-card-footer">
                   <div class="task-card-author">
                     <span class="avatar-bubble avatar-bubble-sm"
-                          style="width: 20px; height: 20px; font-size: 0.65rem; background-color: {{ card.created_by.avatar_color|default:'#4F46E5' }};">
+                          style="width: 20px; height: 20px; font-size: 0.65rem; background-color: {{ card.created_by.avatar_color|default:'#4F46E5' }};"
+                          title="Author: @{{ card.created_by.username }}">
                       {{ card.created_by.initials }}
                     </span>
                     <span>@{{ card.created_by.username }}</span>
                   </div>
-                  <span class="card-position-badge">#{{ card.position }}</span>
+
+                  <div class="task-card-badges">
+                    <!-- Comment count badge -->
+                    <span class="card-comment-badge {% if not card.comments_count %}hidden{% endif %}"
+                          id="card-comment-badge-{{ card.id }}"
+                          title="{{ card.comments_count }} comment(s)">
+                      💬 <span class="comment-count-num">{{ card.comments_count }}</span>
+                    </span>
+
+                    <!-- Assignee Avatar -->
+                    <span class="card-assignee-wrap {% if not card.assignee %}hidden{% endif %}" id="card-assignee-wrap-{{ card.id }}">
+                      {% if card.assignee %}
+                        <span class="avatar-bubble avatar-bubble-xs card-assignee-avatar"
+                              style="background-color: {{ card.assignee.avatar_color|default:'#64748B' }};"
+                              title="Assigned to @{{ card.assignee.username }}">
+                          {{ card.assignee.initials }}
+                        </span>
+                      {% endif %}
+                    </span>
+
+                    <span class="card-position-badge">#{{ card.position }}</span>
+                  </div>
                 </div>
               </div>
             {% endfor %}
@@ -214,10 +254,10 @@
 </div>
 
 <!-- =========================================================================
-     CARD DETAIL & EDIT MODAL
+     CARD DETAIL, EDIT & COMMENTS MODAL (Phase 4)
      ========================================================================= -->
 <div class="modal-backdrop" id="card-modal" style="display: none;">
-  <div class="modal-dialog">
+  <div class="modal-dialog modal-dialog-lg">
     <div class="modal-header">
       <h3 class="modal-title" id="card-modal-heading">Card Details</h3>
       <button type="button" class="modal-close-btn" id="card-modal-close">✕</button>
@@ -239,16 +279,27 @@
         <label for="modal-card-desc" class="form-label" style="font-weight: 600;">Description</label>
         <textarea id="modal-card-desc"
                   class="form-control"
-                  rows="4"
+                  rows="3"
                   placeholder="Add a more detailed description..."
                   {% if not can_edit %}disabled{% endif %}></textarea>
       </div>
 
-      <div class="modal-meta-info" id="modal-card-meta" style="margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--text-muted);">
+      <!-- Assignee Dropdown (Phase 4) -->
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label for="modal-card-assignee" class="form-label" style="font-weight: 600;">Assignee</label>
+        <select id="modal-card-assignee" class="form-control" {% if not can_edit %}disabled{% endif %}>
+          <option value="">Unassigned</option>
+          {% for m in memberships %}
+            <option value="{{ m.user.id }}">@{{ m.user.username }} ({{ m.role }})</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="modal-meta-info" id="modal-card-meta" style="margin-bottom: 1.25rem; font-size: 0.85rem; color: var(--text-muted);">
         <!-- Filled dynamically -->
       </div>
 
-      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 1rem;">
         {% if can_edit %}
           <button type="button" class="btn btn-outline-danger btn-sm" id="modal-card-delete-btn">
             🗑️ Delete Card
@@ -269,8 +320,62 @@
         {% endif %}
       </div>
     </form>
+
+    <!-- Comments Section (Phase 4) -->
+    <div class="card-comments-section" id="card-comments-section">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem;">
+        <h4 style="font-size: 1rem; font-weight: 600; margin: 0;">Discussion</h4>
+        <span class="role-badge" id="modal-comments-count-badge" style="font-size: 0.75rem;">0 comments</span>
+      </div>
+
+      <!-- Comments Thread (oldest first, rendered strictly with textContent for XSS safety) -->
+      <div class="comments-list" id="card-comments-list">
+        <div class="comments-loading">Loading comments...</div>
+      </div>
+
+      <!-- Add Comment Form -->
+      <div class="add-comment-box" style="margin-top: 1rem;">
+        {% if can_edit %}
+          <textarea id="new-comment-body"
+                    class="form-control"
+                    rows="2"
+                    placeholder="Write a comment... (use @username to mention members)"
+                    maxlength="2000"></textarea>
+          <div style="display: flex; justify-content: flex-end; margin-top: 0.5rem;">
+            <button type="button" class="btn btn-primary btn-sm" id="btn-submit-comment">
+              Post Comment
+            </button>
+          </div>
+        {% else %}
+          <p style="font-size: 0.85rem; color: var(--text-muted); font-style: italic; margin-top: 0.5rem;">
+            🔒 Viewers can read discussion comments but cannot submit new ones.
+          </p>
+        {% endif %}
+      </div>
+    </div>
   </div>
 </div>
+
+<!-- =========================================================================
+     ACTIVITY SLIDE-OUT PANEL (Phase 4)
+     ========================================================================= -->
+<div class="activity-drawer-backdrop" id="activity-drawer-backdrop" style="display: none;"></div>
+<aside class="activity-drawer" id="activity-drawer">
+  <div class="activity-drawer-header">
+    <h3 class="activity-drawer-title">Board Activity</h3>
+    <button type="button" class="activity-drawer-close" id="activity-drawer-close">✕</button>
+  </div>
+  <div class="activity-drawer-body">
+    <div class="activity-list" id="activity-list">
+      <div class="activity-empty">Loading activity log...</div>
+    </div>
+    <div class="activity-load-more-wrap" id="activity-load-more-wrap" style="display: none; text-align: center; margin-top: 1rem;">
+      <button type="button" class="btn btn-secondary btn-sm" id="activity-load-more-btn">
+        Load more
+      </button>
+    </div>
+  </div>
+</aside>
 
 <!-- =========================================================================
      DELETE LIST CONFIRMATION MODAL

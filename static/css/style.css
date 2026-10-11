@@ -1284,3 +1284,390 @@ a:hover {
   }
 }
 
+/* ==============================================================================
+   PHASE 4: Notifications, Presence, Activity Log & Card Comments
+   ============================================================================== */
+
+/* In-App Notifications Widget */
+.notification-container {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.notification-bell-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0.4rem;
+  border-radius: var(--radius-sm);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.notification-bell-btn:hover {
+  color: var(--primary);
+  background-color: #f1f5f9;
+}
+
+.notification-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background-color: var(--danger);
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.1rem 0.35rem;
+  border-radius: 9999px;
+  line-height: 1;
+  min-width: 16px;
+  text-align: center;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.notification-badge.hidden {
+  display: none;
+}
+
+.notification-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 320px;
+  background: #ffffff;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  animation: fadeInDown 0.15s ease;
+}
+
+.notification-dropdown.hidden {
+  display: none;
+}
+
+.notification-dropdown-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-color);
+  background-color: #f8fafc;
+}
+
+.notification-dropdown-title {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.notification-list {
+  overflow-y: auto;
+  max-height: 350px;
+  padding: 0.25rem 0;
+}
+
+.notification-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid #f1f5f9;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.notification-item:hover {
+  background-color: #f8fafc;
+}
+
+.notification-item.unread {
+  background-color: #f0fdf4;
+}
+
+.notification-item.unread .notification-msg {
+  font-weight: 600;
+}
+
+.notification-content {
+  flex: 1;
+}
+
+.notification-msg {
+  font-size: 0.8rem;
+  color: var(--text-main);
+  margin: 0 0 0.2rem 0;
+  line-height: 1.35;
+}
+
+.notification-time {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.notification-empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* Presence Viewing Avatars in Header */
+.board-presence-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: 0.5rem;
+  background-color: #f8fafc;
+  padding: 0.2rem 0.5rem;
+  border-radius: 9999px;
+  border: 1px solid var(--border-color);
+}
+
+.presence-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.presence-avatars-group {
+  display: inline-flex;
+  align-items: center;
+}
+
+.presence-avatars-group .avatar-bubble {
+  margin-left: -6px;
+  box-shadow: 0 0 0 2px #fff;
+  transition: transform 0.15s ease;
+}
+
+.presence-avatars-group .avatar-bubble:first-child {
+  margin-left: 0;
+}
+
+.presence-avatars-group .avatar-bubble:hover {
+  transform: translateY(-2px) scale(1.1);
+  z-index: 5;
+}
+
+.presence-overflow-badge {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background-color: #64748b;
+  color: #ffffff;
+  font-size: 0.65rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: -6px;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+/* Task Card Face Additions: Assignee & Comment Count */
+.task-card-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.card-comment-badge {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background-color: #f1f5f9;
+  padding: 0.1rem 0.35rem;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.card-comment-badge.hidden,
+.card-assignee-wrap.hidden {
+  display: none !important;
+}
+
+.avatar-bubble-xs {
+  width: 22px;
+  height: 22px;
+  font-size: 0.65rem;
+}
+
+/* Modal Dialog Large for Comments */
+.modal-dialog-lg {
+  max-width: 620px;
+}
+
+/* Comments Thread in Modal */
+.card-comments-section {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.comments-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.comment-item {
+  background-color: #f8fafc;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.comment-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.comment-author-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.comment-date {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.comment-edited-tag {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-left: 0.25rem;
+}
+
+.comment-actions {
+  display: inline-flex;
+  gap: 0.4rem;
+}
+
+.comment-body {
+  font-size: 0.875rem;
+  color: var(--text-main);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.comment-edit-box {
+  margin-top: 0.4rem;
+}
+
+/* Activity Side-Out Drawer Panel */
+.activity-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(15, 23, 42, 0.4);
+  z-index: 1040;
+}
+
+.activity-drawer {
+  position: fixed;
+  top: 0;
+  right: -380px;
+  width: 380px;
+  height: 100vh;
+  background-color: #ffffff;
+  box-shadow: var(--shadow-lg);
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+  transition: right 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.activity-drawer.open {
+  right: 0;
+}
+
+.activity-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.1rem 1.25rem;
+  border-bottom: 1px solid var(--border-color);
+  background-color: #f8fafc;
+}
+
+.activity-drawer-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.activity-drawer-close {
+  background: transparent;
+  border: none;
+  font-size: 1.1rem;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0.25rem;
+}
+
+.activity-drawer-close:hover {
+  color: var(--danger);
+}
+
+.activity-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.25rem;
+}
+
+.activity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.activity-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.activity-item-content {
+  flex: 1;
+}
+
+.activity-summary {
+  font-size: 0.85rem;
+  color: var(--text-main);
+  line-height: 1.35;
+  margin: 0 0 0.2rem 0;
+}
+
+.activity-time {
+  font-size: 0.725rem;
+  color: var(--text-muted);
+}
+
+.activity-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  padding: 2.5rem 0;
+}
+

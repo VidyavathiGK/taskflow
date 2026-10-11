@@ -1,15 +1,19 @@
 from django.urls import path
 from .views import (
+    ActivityListApiView,
     BoardCreateView,
     BoardDeleteView,
     BoardDetailView,
     BoardMembersView,
     BoardSnapshotApiView,
     BoardUpdateView,
+    CardAssignApiView,
+    CardCommentsApiView,
     CardCreateApiView,
     CardDeleteApiView,
     CardMoveApiView,
     CardUpdateApiView,
+    CommentDetailApiView,
     ListCreateApiView,
     ListDeleteApiView,
     ListMoveApiView,
@@ -31,16 +35,23 @@ urlpatterns = [
     # Phase 3 Reconnection Snapshot Endpoint
     path("<int:board_id>/snapshot/", BoardSnapshotApiView.as_view(), name="api_board_snapshot"),
 
-    # Phase 2 JSON API Endpoints (POST only)
-    # List Endpoints
+    # Phase 4 Activity Endpoint
+    path("<int:board_id>/activity/", ActivityListApiView.as_view(), name="api_board_activity"),
+
+    # Phase 2 & 4 List Endpoints
     path("<int:board_id>/lists/create/", ListCreateApiView.as_view(), name="api_list_create"),
     path("<int:board_id>/lists/<int:list_id>/rename/", ListRenameApiView.as_view(), name="api_list_rename"),
     path("<int:board_id>/lists/<int:list_id>/delete/", ListDeleteApiView.as_view(), name="api_list_delete"),
     path("<int:board_id>/lists/<int:list_id>/move/", ListMoveApiView.as_view(), name="api_list_move"),
 
-    # Card Endpoints
+    # Phase 2 & 4 Card Endpoints
     path("<int:board_id>/lists/<int:list_id>/cards/create/", CardCreateApiView.as_view(), name="api_card_create"),
     path("<int:board_id>/cards/<int:card_id>/update/", CardUpdateApiView.as_view(), name="api_card_update"),
     path("<int:board_id>/cards/<int:card_id>/delete/", CardDeleteApiView.as_view(), name="api_card_delete"),
     path("<int:board_id>/cards/<int:card_id>/move/", CardMoveApiView.as_view(), name="api_card_move"),
+    path("<int:board_id>/cards/<int:card_id>/assign/", CardAssignApiView.as_view(), name="api_card_assign"),
+
+    # Phase 4 Comment Endpoints
+    path("<int:board_id>/cards/<int:card_id>/comments/", CardCommentsApiView.as_view(), name="api_card_comments"),
+    path("<int:board_id>/comments/<int:comment_id>/", CommentDetailApiView.as_view(), name="api_comment_detail"),
 ]

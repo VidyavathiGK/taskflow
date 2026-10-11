@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Board, BoardList, BoardMembership, Card
+from .models import Activity, Board, BoardList, BoardMembership, Card, Comment, Notification
 
 
 class BoardMembershipInline(admin.TabularInline):
@@ -19,7 +19,7 @@ class BoardListInline(admin.TabularInline):
 class CardInline(admin.TabularInline):
     model = Card
     extra = 1
-    fields = ("title", "position", "created_by", "created_at")
+    fields = ("title", "assignee", "position", "created_by", "created_at")
     readonly_fields = ("created_at",)
 
 
@@ -60,10 +60,39 @@ class BoardListAdmin(admin.ModelAdmin):
 
 @admin.register(Card)
 class CardAdmin(admin.ModelAdmin):
-    list_display = ("title", "board_list", "get_board", "position", "created_by", "created_at")
+    list_display = ("title", "board_list", "get_board", "assignee", "position", "created_by", "created_at")
     list_filter = ("board_list__board", "created_at")
-    search_fields = ("title", "description", "created_by__username")
+    search_fields = ("title", "description", "created_by__username", "assignee__username")
 
     @admin.display(description="Board")
     def get_board(self, obj):
         return obj.board_list.board.title
+
+
+@admin.register(Activity)
+class ActivityAdmin(admin.ModelAdmin):
+    """Activity is an immutable audit log; all fields are read-only in the admin interface."""
+    list_display = ("summary", "board", "actor", "verb", "created_at")
+    list_filter = ("verb", "created_at", "board")
+    search_fields = ("summary", "actor__username", "board__title")
+    readonly_fields = [f.name for f in Activity._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Comment)
+class CommentAdmin(admin.ModelAdmin):
+    list_display = ("card", "author", "created_at", "edited_at")
+    list_filter = ("created_at", "edited_at")
+    search_fields = ("body", "author__username", "card__title")
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ("recipient", "actor", "board", "card", "kind", "is_read", "created_at")
+    list_filter = ("kind", "is_read", "created_at")
+    search_fields = ("message", "recipient__username", "actor__username", "board__title")

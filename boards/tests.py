@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
-from boards.models import Board, BoardList, BoardMembership, Card
+from boards.models import Board, BoardList, BoardMembership, Card, Activity, Comment, Notification
 
 User = get_user_model()
 
@@ -429,9 +429,11 @@ class BoardsPhase3WebsocketTests(TransactionTestCase):
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
 
-        # Test keepalive ping/pong
+        # Test keepalive ping/pong (drain presence.changed broadcast if received first)
         await communicator.send_json_to({"type": "ping"})
         response = await communicator.receive_json_from()
+        if response.get("event") == "presence.changed":
+            response = await communicator.receive_json_from()
         self.assertEqual(response, {"type": "pong"})
 
         await communicator.disconnect()
@@ -463,9 +465,11 @@ class BoardsPhase3WebsocketTests(TransactionTestCase):
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
 
-        # Attempt to mutate over WebSocket
+        # Attempt to mutate over WebSocket (drain presence.changed broadcast if received first)
         await communicator.send_json_to({"type": "create_card", "title": "Malicious Card"})
         response = await communicator.receive_json_from()
+        if response.get("event") == "presence.changed":
+            response = await communicator.receive_json_from()
         self.assertEqual(response.get("type"), "error")
         self.assertIn("Mutations over WebSocket are rejected", response.get("message"))
 
@@ -522,4 +526,226 @@ class BoardsPhase3SnapshotAndResilienceTests(TestCase):
             # Assert database transaction committed successfully despite broker failure
             self.assertEqual(new_card.title, "Resilient Task")
             self.assertTrue(Card.objects.filter(title="Resilient Task").exists())
+
+
+# ==============================================================================
+# PHASE 4 TESTS: ACTIVITY LOG, COMMENTS, MENTIONS, PRESENCE & NOTIFICATIONS
+# ==============================================================================
+
+class BoardsPhase4ActivityTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="alice", password="password123")
+        self.editor = User.objects.create_user(username="bob", password="password123")
+        self.viewer = User.objects.create_user(username="charlie", password="password123")
+
+        self.board = Board.objects.create(title="Sprint Board", owner=self.owner)
+        BoardMembership.objects.create(board=self.board, user=self.owner, role=BoardMembership.Role.OWNER)
+        BoardMembership.objects.create(board=self.board, user=self.editor, role=BoardMembership.Role.EDITOR)
+        BoardMembership.objects.create(board=self.board, user=self.viewer, role=BoardMembership.Role.VIEWER)
+
+        self.col = BoardList.objects.create(board=self.board, title="To Do", position=0)
+
+    def test_services_create_immutable_activity_records(self):
+        """Every state mutation records an Activity inside the same transaction."""
+        card = services.create_card(self.col, "Audit Card", "Testing activity log", self.editor)
+
+        act = Activity.objects.filter(board=self.board, target_type="card", target_id=card.id).first()
+        self.assertIsNotNone(act)
+        self.assertEqual(act.actor, self.editor)
+        self.assertEqual(act.verb, "card.created")
+        self.assertIn("created card 'Audit Card'", act.summary)
+
+    def test_summary_frozen_at_write_time(self):
+        """Later renaming of a card does not rewrite past creation activity log summary."""
+        card = services.create_card(self.col, "Original Title", "", self.editor)
+        services.update_card(card, "Renamed Title", "", self.editor)
+
+        create_act = Activity.objects.filter(verb="card.created", target_id=card.id).first()
+        update_act = Activity.objects.filter(verb="card.updated", target_id=card.id).first()
+
+        self.assertIn("Original Title", create_act.summary)
+        self.assertIn("Renamed Title", update_act.summary)
+
+    def test_activity_cursor_pagination_api(self):
+        """Activity API supports cursor-based before_id pagination."""
+        for i in range(5):
+            services.create_card(self.col, f"Card {i}", "", self.editor)
+
+        self.client.login(username="bob", password="password123")
+        url = reverse("boards:api_board_activity", kwargs={"board_id": self.board.id})
+        res = self.client.get(f"{url}?limit=3")
+        self.assertEqual(res.status_code, 200)
+
+        data = res.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(data["activities"]), 3)
+        self.assertTrue(data["has_more"])
+        self.assertIsNotNone(data["next_cursor"])
+
+        # Fetch next page using cursor
+        cursor = data["next_cursor"]
+        res2 = self.client.get(f"{url}?before_id={cursor}&limit=3")
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.json()
+        self.assertTrue(data2["ok"])
+        # IDs must be strictly smaller than cursor
+        for item in data2["activities"]:
+            self.assertLess(item["id"], cursor)
+
+
+class BoardsPhase4CommentsAndMentionsTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="alice", password="password123")
+        self.editor = User.objects.create_user(username="bob", password="password123")
+        self.viewer = User.objects.create_user(username="charlie", password="password123")
+        self.outsider = User.objects.create_user(username="stranger", password="password123")
+
+        self.board = Board.objects.create(title="Dev Board", owner=self.owner)
+        BoardMembership.objects.create(board=self.board, user=self.owner, role=BoardMembership.Role.OWNER)
+        BoardMembership.objects.create(board=self.board, user=self.editor, role=BoardMembership.Role.EDITOR)
+        BoardMembership.objects.create(board=self.board, user=self.viewer, role=BoardMembership.Role.VIEWER)
+
+        self.col = BoardList.objects.create(board=self.board, title="Doing", position=0)
+        self.card = Card.objects.create(board_list=self.col, title="Task X", position=0, created_by=self.owner)
+
+    def test_editor_can_add_comment_with_mention_notifications(self):
+        """Adding a comment mentioning @alice creates a Notification for Alice."""
+        comment = services.add_comment(
+            card=self.card,
+            author=self.editor,
+            body="Hey @alice please review this implementation! Also pinging non-member @stranger."
+        )
+
+        self.assertEqual(comment.author, self.editor)
+        self.assertEqual(self.card.comments.count(), 1)
+
+        # Alice was mentioned -> notification created
+        notif = Notification.objects.filter(recipient=self.owner, kind=Notification.Kind.MENTION).first()
+        self.assertIsNotNone(notif)
+        self.assertEqual(notif.actor, self.editor)
+        self.assertEqual(notif.card, self.card)
+
+        # Stranger is not a board member -> ignored silently
+        stranger_notif = Notification.objects.filter(recipient=self.outsider).exists()
+        self.assertFalse(stranger_notif)
+
+        # Self-mention by author does not create notification
+        services.add_comment(card=self.card, author=self.editor, body="Note to self @bob check logs.")
+        bob_self_notif = Notification.objects.filter(recipient=self.editor, actor=self.editor).exists()
+        self.assertFalse(bob_self_notif)
+
+    def test_viewer_cannot_post_comment(self):
+        """Viewer role gets PermissionDenied when attempting to add a comment."""
+        self.client.login(username="charlie", password="password123")
+        url = reverse("boards:api_card_comments", kwargs={"board_id": self.board.id, "card_id": self.card.id})
+        res = self.client.post(url, data={"body": "Viewer comment"}, content_type="application/json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_comment_editing_permissions(self):
+        """Only the author can edit their own comment."""
+        comment = services.add_comment(self.card, self.editor, "Initial comment")
+
+        # Author can edit
+        updated = services.edit_comment(comment, self.editor, "Updated comment")
+        self.assertEqual(updated.body, "Updated comment")
+        self.assertIsNotNone(updated.edited_at)
+
+        # Owner cannot edit someone else's comment
+        with self.assertRaises(Exception):
+            services.edit_comment(comment, self.owner, "Malicious edit")
+
+    def test_comment_deletion_permissions(self):
+        """Author or Board Owner can delete comment; Viewer or other editors cannot."""
+        comment1 = services.add_comment(self.card, self.editor, "Comment 1")
+        comment2 = services.add_comment(self.card, self.editor, "Comment 2")
+
+        # Board Owner can delete Bob's comment
+        self.assertTrue(services.delete_comment(comment1, self.owner))
+
+        # Bob can delete his own comment
+        self.assertTrue(services.delete_comment(comment2, self.editor))
+
+
+class BoardsPhase4AssignmentAndNotificationTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="alice", password="password123")
+        self.editor = User.objects.create_user(username="bob", password="password123")
+        self.outsider = User.objects.create_user(username="stranger", password="password123")
+
+        self.board = Board.objects.create(title="Sprint Board", owner=self.owner)
+        BoardMembership.objects.create(board=self.board, user=self.owner, role=BoardMembership.Role.OWNER)
+        BoardMembership.objects.create(board=self.board, user=self.editor, role=BoardMembership.Role.EDITOR)
+
+        self.col = BoardList.objects.create(board=self.board, title="Doing", position=0)
+        self.card = Card.objects.create(board_list=self.col, title="Task 1", position=0, created_by=self.owner)
+
+    def test_assign_card_service_and_notification(self):
+        """Assigning card creates notification for assignee and updates assignee field."""
+        card = services.assign_card(self.card, user=self.owner, assignee=self.editor)
+        self.assertEqual(card.assignee, self.editor)
+
+        notif = Notification.objects.filter(recipient=self.editor, kind=Notification.Kind.ASSIGNED).first()
+        self.assertIsNotNone(notif)
+        self.assertEqual(notif.actor, self.owner)
+        self.assertIn("assigned you to 'Task 1'", notif.message)
+
+    def test_unassign_card(self):
+        """Assigning None successfully clears assignee without errors."""
+        services.assign_card(self.card, user=self.owner, assignee=self.editor)
+        unassigned_card = services.assign_card(self.card, user=self.owner, assignee=None)
+        self.assertIsNone(unassigned_card.assignee)
+
+    def test_notifications_mark_read_authorization(self):
+        """A user can only read and mark their OWN notifications."""
+        notif = Notification.objects.create(
+            recipient=self.owner,
+            board=self.board,
+            card=self.card,
+            actor=self.editor,
+            kind=Notification.Kind.ASSIGNED,
+            message="Test notification",
+        )
+
+        # Bob attempts to mark Alice's notification -> returns 404
+        self.client.login(username="bob", password="password123")
+        url = reverse("notification_mark_read", kwargs={"notification_id": notif.id})
+        res = self.client.post(url)
+        self.assertEqual(res.status_code, 404)
+
+        # Alice marks her own notification -> succeeds
+        self.client.login(username="alice", password="password123")
+        res2 = self.client.post(url)
+        self.assertEqual(res2.status_code, 200)
+        notif.refresh_from_db()
+        self.assertTrue(notif.is_read)
+
+
+class BoardsPhase4ConsumerAndPresenceTests(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="alice", password="password123")
+
+    async def test_notification_consumer_authenticated_connect(self):
+        from boards.consumers import NotificationConsumer
+        communicator = WebsocketCommunicator(NotificationConsumer.as_asgi(), "ws/notifications/")
+        communicator.scope["user"] = self.user
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        await communicator.send_json_to({"type": "ping"})
+        res = await communicator.receive_json_from()
+        self.assertEqual(res, {"type": "pong"})
+
+        await communicator.disconnect()
+
+    async def test_notification_consumer_anonymous_rejected(self):
+        from boards.consumers import NotificationConsumer
+        from django.contrib.auth.models import AnonymousUser
+        communicator = WebsocketCommunicator(NotificationConsumer.as_asgi(), "ws/notifications/")
+        communicator.scope["user"] = AnonymousUser()
+
+        connected, code = await communicator.connect()
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+
 

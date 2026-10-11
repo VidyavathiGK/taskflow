@@ -5,23 +5,26 @@ Creates:
 - 3 users: alice (Owner), bob (Editor), charlie (Viewer)
 - 1 board: 'Product Roadmap & Sprint 1'
 - 3 lists: 'Backlog', 'In Progress', 'Completed'
-- 8 task cards distributed across lists with descriptions and authors
+- 8 task cards with descriptions, authors, and card assignments
+- Card discussion comments with @mentions
+- In-app notification alerts
+- Immutable activity log entries
 """
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from boards.models import Board, BoardList, BoardMembership, Card
+from boards.models import Activity, Board, BoardList, BoardMembership, Card, Comment, Notification
 
 User = get_user_model()
 
 
 class Command(BaseCommand):
-    help = "Seeds demo users, a board workspace, lists, and task cards for instant local testing."
+    help = "Seeds demo users, a board workspace, lists, cards, assignments, comments, and activities for testing."
 
     def handle(self, *args, **options):
-        self.stdout.write(self.style.NOTICE("Seeding TaskFlow demo environment..."))
+        self.stdout.write(self.style.NOTICE("Seeding TaskFlow demo environment (Phase 4)..."))
 
         with transaction.atomic():
             # 1. Create or retrieve demo users
@@ -122,6 +125,7 @@ class Command(BaseCommand):
                     "description": "Show live avatar badges with avatar_color when collaborators are active on the board.",
                     "position": 0,
                     "created_by": users["alice"],
+                    "assignee": users["bob"],
                 },
                 {
                     "list": columns["Backlog"],
@@ -129,6 +133,7 @@ class Command(BaseCommand):
                     "description": "Card hover elevation and smooth displacement transitions between columns.",
                     "position": 1,
                     "created_by": users["bob"],
+                    "assignee": users["alice"],
                 },
                 {
                     "list": columns["Backlog"],
@@ -136,6 +141,7 @@ class Command(BaseCommand):
                     "description": "Send invite confirmation emails when users are added to board workspaces.",
                     "position": 2,
                     "created_by": users["charlie"],
+                    "assignee": None,
                 },
                 # In Progress
                 {
@@ -144,6 +150,7 @@ class Command(BaseCommand):
                     "description": "Board, BoardMembership, BoardList, and Card models with optimized composite indexes.",
                     "position": 0,
                     "created_by": users["alice"],
+                    "assignee": users["alice"],
                 },
                 {
                     "list": columns["In Progress"],
@@ -151,6 +158,7 @@ class Command(BaseCommand):
                     "description": "Allow owner to invite by username/email, promote/demote editors, and remove members.",
                     "position": 1,
                     "created_by": users["bob"],
+                    "assignee": users["bob"],
                 },
                 {
                     "list": columns["In Progress"],
@@ -158,6 +166,7 @@ class Command(BaseCommand):
                     "description": "Clean Vanilla CSS flex/grid column layout with dark navigation and vibrant badges.",
                     "position": 2,
                     "created_by": users["alice"],
+                    "assignee": None,
                 },
                 # Completed
                 {
@@ -166,6 +175,7 @@ class Command(BaseCommand):
                     "description": "Django 5 project skeleton with python-decouple environment settings and .env.example.",
                     "position": 0,
                     "created_by": users["alice"],
+                    "assignee": users["alice"],
                 },
                 {
                     "list": columns["Completed"],
@@ -173,27 +183,128 @@ class Command(BaseCommand):
                     "description": "Extends AbstractUser from initial migration for future-proof WebSocket presence.",
                     "position": 1,
                     "created_by": users["bob"],
+                    "assignee": users["bob"],
                 },
             ]
 
-            # Clear existing cards on this board if re-seeding to keep exact ~8 cards
+            # Clear existing cards and activities on this board to seed cleanly
             Card.objects.filter(board_list__board=board).delete()
+            Activity.objects.filter(board=board).delete()
+            Notification.objects.filter(board=board).delete()
 
+            created_cards = []
             for item in cards_data:
-                Card.objects.create(
+                c = Card.objects.create(
                     board_list=item["list"],
                     title=item["title"],
                     description=item["description"],
                     position=item["position"],
                     created_by=item["created_by"],
+                    assignee=item["assignee"],
+                )
+                created_cards.append(c)
+
+                # Record creation activity
+                Activity.objects.create(
+                    board=board,
+                    actor=item["created_by"],
+                    verb="card.created",
+                    target_type="card",
+                    target_id=c.id,
+                    summary=f"created card '{c.title}' in '{item['list'].title}'",
                 )
 
+                if item["assignee"]:
+                    Activity.objects.create(
+                        board=board,
+                        actor=item["created_by"],
+                        verb="card.assigned",
+                        target_type="card",
+                        target_id=c.id,
+                        summary=f"assigned '{c.title}' to {item['assignee'].username}",
+                    )
+
+            # 6. Create sample comments with @mentions and notifications
+            first_card = created_cards[0]
+            comment1 = Comment.objects.create(
+                card=first_card,
+                author=users["bob"],
+                body="@alice please review the WebSocket presence architecture when ready!",
+            )
+            Activity.objects.create(
+                board=board,
+                actor=users["bob"],
+                verb="comment.added",
+                target_type="comment",
+                target_id=comment1.id,
+                summary=f"commented on '{first_card.title}'",
+            )
+            Notification.objects.create(
+                recipient=users["alice"],
+                board=board,
+                card=first_card,
+                actor=users["bob"],
+                kind=Notification.Kind.MENTION,
+                message=f"bob mentioned you in a comment on '{first_card.title}'",
+                is_read=False,
+            )
+
+            comment2 = Comment.objects.create(
+                card=first_card,
+                author=users["alice"],
+                body="Looks solid! Redis sorted sets are configured and pruning works cleanly.",
+            )
+            Activity.objects.create(
+                board=board,
+                actor=users["alice"],
+                verb="comment.added",
+                target_type="comment",
+                target_id=comment2.id,
+                summary=f"commented on '{first_card.title}'",
+            )
+
+            # Notification for card assignment to Bob
+            Notification.objects.create(
+                recipient=users["bob"],
+                board=board,
+                card=first_card,
+                actor=users["alice"],
+                kind=Notification.Kind.ASSIGNED,
+                message=f"alice assigned you to '{first_card.title}'",
+                is_read=False,
+            )
+
+            fourth_card = created_cards[3]
+            comment3 = Comment.objects.create(
+                card=fourth_card,
+                author=users["alice"],
+                body="@bob composite indexes are deployed on PostgreSQL.",
+            )
+            Activity.objects.create(
+                board=board,
+                actor=users["alice"],
+                verb="comment.added",
+                target_type="comment",
+                target_id=comment3.id,
+                summary=f"commented on '{fourth_card.title}'",
+            )
+            Notification.objects.create(
+                recipient=users["bob"],
+                board=board,
+                card=fourth_card,
+                actor=users["alice"],
+                kind=Notification.Kind.MENTION,
+                message=f"alice mentioned you in a comment on '{fourth_card.title}'",
+                is_read=False,
+            )
+
         self.stdout.write(self.style.SUCCESS(
-            "\nSuccessfully seeded TaskFlow demo data!\n"
+            "\nSuccessfully seeded TaskFlow Phase 4 demo data!\n"
             "--------------------------------------------------\n"
             "Demo Credentials (all share password: 'password123'):\n"
             "  1. alice   (Role: OWNER)  - full administrative control\n"
             "  2. bob     (Role: EDITOR) - member with edit privileges\n"
             "  3. charlie (Role: VIEWER) - member with read-only access\n"
+            "Features Seeded: Cards, Assignees, Comments with @mentions, Notifications & Activities.\n"
             "--------------------------------------------------"
         ))

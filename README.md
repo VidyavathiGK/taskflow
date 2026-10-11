@@ -1,12 +1,12 @@
 # TaskFlow — Real-time Collaborative Task Board (Trello-Lite)
 
-> **Phase 3: Real-Time Collaborative Sync (Django Channels, WebSockets, Daphne & Redis)**
+> **Phase 4: Activity Log, Card Comments with @Mentions, Live Presence & In-App Notifications**
 
 TaskFlow is a collaborative Kanban task board built with Python 3.12+ and Django 5.x on top of PostgreSQL, with live real-time sync powered by Django Channels and Redis.
 
-In **Phases 1, 2 & 3**, the project establishes:
+In **Phases 1, 2, 3 & 4**, the project establishes:
 - Secure authentication with a custom User model (equipped with `avatar_color` for live presence).
-- Relational schema with role-based access control (RBAC): `Board`, `BoardMembership`, `BoardList`, and `Card`.
+- Relational schema with role-based access control (RBAC): `Board`, `BoardMembership`, `BoardList`, `Card`, `Activity`, `Comment`, and `Notification`.
 - Centralized access control returning `404 Not Found` for non-members to prevent workspace enumeration.
 - Board workspace CRUD, member invitations, role promotions, and member removals restricted to workspace `OWNER`.
 - **Dedicated business logic service layer** (`boards/services.py`) encapsulating all mutations with `select_for_update()` concurrency locks.
@@ -18,9 +18,14 @@ In **Phases 1, 2 & 3**, the project establishes:
 - **Client-side echo cancellation & collision handling** via ephemeral tab `client_id` and active drag queueing.
 - **Automatic reconnect with exponential backoff & snapshot state reconciliation.**
 - **Real-time membership lifecycle updates:** Role demotions and member removals update or kick clients live.
+- **Immutable audit activity log** recorded in same-transaction writes with frozen write-time summaries and cursor-based pagination.
+- **Card comment discussion threads** with chronological ordering, card badge counters, and strict XSS prevention (`textContent`).
+- **Regex @mention extraction & in-app notifications** delivered over private user WebSockets (`ws/notifications/`) to an interactive navbar bell.
+- **Live board presence tracking** powered by Redis sorted sets with 60s stale pruning, 20s client heartbeats, and multi-tab deduplication.
+- **Zero N+1 database queries:** Board detail page optimized to exactly 7 total queries ($O(1)$ query scaling).
 - **Redis channel layer with zero-setup in-memory fallback** and broker outage resilience.
-- Django Admin with nested inlines for convenient entity inspection.
-- A `seed_demo` management command for instant local testing.
+- Django Admin with inline models for convenient entity inspection.
+- A comprehensive `seed_demo` management command for instant local testing.
 
 ---
 
@@ -338,9 +343,111 @@ All messages published to the `board_<board_id>` channel layer group adhere to a
 | `card.updated` | Card title/description edited | `{"card": {"id", "title", "description"}}` | Updates card in DOM; live-updates edit modal if currently open |
 | `card.deleted` | Task card deleted | `{"card_id": int, "list_id": int}` | Removes card DOM; closes edit modal if open with warning |
 | `card.moved` | Card dragged/reordered | `{"card_id": int, "source_list_id": int, "target_list_id": int, "new_position": int}` | Repositions card in target list; recalculates indices |
+| `card.assigned` | Card assignee updated | `{"card_id": int, "assignee": {"id", "username", "avatar_color", "initials"}}` | Updates card assignee badge and modal select |
+| `comment.added` | New comment posted | `{"comment": {"id", "card_id", "author", "body", "created_at"}, "comments_count": int}` | Appends comment to modal thread; updates card badge |
+| `comment.edited` | Comment body edited | `{"comment": {"id", "card_id", "body", "edited_at"}}` | Updates comment text and edited timestamp |
+| `comment.deleted`| Comment removed | `{"comment_id": int, "card_id": int, "comments_count": int}` | Removes comment from thread; updates card badge |
+| `activity.created`| Board mutation logged | `{"activity": {"id", "summary", "created_at", "actor": {"username", "avatar_color"}}}` | Prepends new activity item to slide-out drawer |
+| `presence.changed`| Member joins/leaves/heartbeats | `{"users": [{"id", "username", "avatar_color", "initials"}]}` | Updates live presence avatar stack in board header |
 | `member.role_changed` | Member role modified | `{"user_id": int, "new_role": str}` | Updates role badge; toggles drag/edit controls live |
 | `member.removed` | Member kicked from board | `{"user_id": int}` | Closes WebSocket with code 4403; redirects user to `/boards/` |
 | `board.deleted` | Board workspace deleted | `{"board_id": int}` | Closes WebSocket with code 4403; redirects all users to `/boards/` |
+
+---
+
+## 🔔 Phase 4: Activity Log, Card Comments, Live Presence & In-App Notifications
+
+### 1. Immutable Activity Log Design & Cursor Pagination
+* **Same-Transaction Audit Writes:**
+  Every state-changing mutation in `boards/services.py` logs an `Activity` record within the exact same `transaction.atomic()` block via `boards/activity.py: log_activity()`. If any mutation fails or rolls back, zero orphan activity records are ever committed.
+* **Write-Time Frozen Summaries:**
+  The `summary` field is pre-rendered at the exact moment of the mutation (e.g., *"bob created card 'Write Docs'"*). If the card is subsequently renamed, moved, or deleted, past activity logs remain historically accurate and immutable.
+* **Database Indexing:**
+  The `Activity` model features a composite index on `(board, -created_at)` guaranteeing sub-millisecond retrieval without table scans.
+* **Cursor-Based Pagination (`before_id`):**
+  The activity drawer endpoint (`GET /boards/<id>/activity/?before_id=<id>&limit=20`) uses strict cursor-based pagination on primary keys (`id < before_id`). Unlike offset-based pagination (`OFFSET N`), cursor pagination is immune to duplicate or skipped entries when new events are continuously prepended.
+* **Live Push Dispatch:**
+  When a transaction commits, `log_activity` triggers `broadcast(board.id, 'activity.created', ...)` via `transaction.on_commit()`, streaming newly logged activities directly into all active drawer views.
+
+### 2. Card Comments, Threading & @Mention Engine
+* **Modal Discussion Thread:**
+  Opening any card reveals its comment thread sorted in chronological order (oldest first).
+* **Regex @Mention Extraction:**
+  When a comment is created via `services.add_comment()`, a regular expression parses all `@username` mentions:
+  ```python
+  pattern = r"(?<!\w)@([a-zA-Z0-9_.+-]+)"
+  ```
+  - Mentions are filtered against **active board members only**.
+  - Non-members mentioned in text are silently ignored.
+  - Self-mentions by the comment author do not generate notifications.
+  - Valid mentions generate a `Notification` record and immediately push a live WebSocket notification to the mentioned user.
+* **Comment Permissions:**
+  - `OWNER` & `EDITOR`: Can create comments on any card.
+  - `VIEWER`: Read-only access; commenting endpoints reject viewers with `403 Forbidden`.
+  - **Editing:** Strictly restricted to the original comment author (`comment.author == request.user`).
+  - **Deletion:** Allowed for either the comment author OR the workspace `OWNER`.
+* **Zero XSS Guarantee:**
+  All comment bodies, activity summaries, and usernames are inserted into the DOM strictly via `textContent` or text node instantiation, entirely eliminating XSS vectors.
+
+### 3. In-App Notification System & Real-Time Delivery
+* **Data Model & Performance:**
+  The `Notification` model tracks `recipient`, `actor`, `board`, `card`, `kind` (`mention` / `assigned`), and `is_read`. It is indexed on `(recipient, is_read, -created_at)` for instant unread query execution.
+* **User-Dedicated WebSocket Channel:**
+  Clients establish a dedicated notification connection to `ws/notifications/`. `NotificationConsumer` authenticates the user and joins the personal group `user_<user_id>`. When a notification is generated anywhere across any board, it is delivered exclusively to that user's private channel.
+* **Navbar Bell & Live Counter:**
+  The navbar features an interactive bell icon with a live unread badge. Clicking the bell displays a dropdown with unread and recent notifications, with actions to mark individual notifications read or mark all read.
+* **Card Assignment Flow:**
+  Assigning a member to a card via `services.assign_card()` updates `Card.assignee`, logs an activity record, dispatches a `card.assigned` event to the board, and dispatches an `assigned` notification to the assignee's personal channel.
+
+### 4. Live Board Presence Tracking (Redis Sorted Sets)
+* **High-Throughput In-Memory Storage:**
+  Presence is stored in Redis sorted sets rather than PostgreSQL, preventing unnecessary database write amplification:
+  - **Key Format:** `presence:board:<board_id>`
+  - **Member Format:** `<user_id>:<channel_name>` (uniquely identifies a specific WebSocket connection)
+  - **Score:** Current Unix timestamp (`time.time()`)
+* **Lifecycle & Stale Pruning:**
+  - **Connect:** Adds the connection member and score; prunes scores older than 60 seconds (`ZREMRANGEBYSCORE`).
+  - **Heartbeat:** Clients send keepalive pings every 20 seconds, updating the score in Redis.
+  - **Disconnect:** Explicitly removes the connection member on socket teardown.
+  - **Key TTL:** A 2-hour TTL is maintained on presence keys (`EXPIRE`) to prevent orphaned keys if a board is abandoned.
+* **Multi-Tab Deduplication:**
+  If a user opens the same board across 3 tabs, all 3 channel names are tracked in Redis, but `get_board_presence()` groups them by `user_id`, rendering a single avatar in the board header.
+* **Broker Fault Tolerance & Test Isolation:**
+  If Redis is down or unreachable, presence calls gracefully degrade, returning an empty presence list without crashing the board. When running automated test suites or using `USE_IN_MEMORY_CHANNEL_LAYER=True`, presence seamlessly uses a thread-safe in-memory dictionary.
+
+### 5. Role & Permission Matrix (Phases 1 – 4)
+
+| Action | Workspace `OWNER` | `EDITOR` | `VIEWER` | Non-Member / Anonymous |
+| :--- | :---: | :---: | :---: | :---: |
+| **View Board, Lists & Cards** | ✅ Yes | ✅ Yes | ✅ Yes (Read-Only) | ❌ **404 Not Found** |
+| **Create / Rename / Delete Lists** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Reorder Lists (Drag & Drop)** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Create / Update / Delete Cards** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Move Cards (Drag & Drop)** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Assign Member to Card** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Post Comments & @Mentions** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Edit Own Comment** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Edit Others' Comments** | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Delete Own Comment** | ✅ Yes | ✅ Yes | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Delete Others' Comments** | ✅ Yes | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **View Activity Log & Presence** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ **404 Not Found** |
+| **Manage Members (Add / Change Roles)**| ✅ Yes | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Edit Metadata / Delete Board** | ✅ Yes | ❌ **403 Forbidden** | ❌ **403 Forbidden** | ❌ **404 Not Found** |
+| **Connect to Board WebSocket** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ **4404 / 4401 Closed** |
+| **Connect to Notifications WebSocket**| ✅ (Own Room) | ✅ (Own Room) | ✅ (Own Room) | ❌ **4401 Closed** |
+
+### 6. Zero N+1 Query Optimization & Benchmark
+* **Board Detail Query Audit:**
+  Loading the full board workspace (`BoardDetailView`) performs exactly **7 total database queries**:
+  1. Session retrieval (Authentication)
+  2. Authenticated user lookup
+  3. Board entity lookup (`BoardAccessMixin`)
+  4. Active membership role verification (`BoardMembership`)
+  5. Lists with prefetched Cards, Card authors, Card assignees, and comment count annotations
+  6. Board memberships with pre-fetched User models
+  7. Board owner lookup
+* **Verification Method:**
+  Benchmarked using `django.db.connection.queries` in authenticated test runs. Regardless of whether a board contains 5 cards or 500 cards, the query count remains strictly constant ($O(1)$ query scaling).
 
 ### 3. Echo Cancellation & Drag Collision Handling
 * **Echo Cancellation:** The client generates an ephemeral `client_id` (e.g. `tab_abc123_171000000`) per browser tab and sends it via the `X-Client-ID` HTTP header. When Daphne pushes the event back to the board group, the originating tab detects `event.client_id === myTabId` and skips the DOM update, preventing visual jitter.

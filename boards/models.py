@@ -250,6 +250,16 @@ class Card(models.Model):
         help_text="User who originally authored this task card."
     )
 
+    # Optional member assigned to this task card
+    assignee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="assigned_cards",
+        help_text="Board member assigned to this task card."
+    )
+
     # Timestamp when the task was initially drafted
     created_at = models.DateTimeField(
         auto_now_add=True,
@@ -270,9 +280,236 @@ class Card(models.Model):
             models.Index(fields=["board_list", "position"]),
             # Index on created_by foreign key speeds up activity and author filtering
             models.Index(fields=["created_by"]),
+            # Index on assignee foreign key speeds up assigned task queries
+            models.Index(fields=["assignee"]),
         ]
         verbose_name = "Card"
         verbose_name_plural = "Cards"
 
     def __str__(self) -> str:
         return self.title
+
+
+# ==============================================================================
+# 5. ACTIVITY MODEL (Immutable board audit log)
+# ==============================================================================
+
+class Activity(models.Model):
+    """
+    Records an immutable audit event for actions occurring within a board workspace.
+
+    ARCHITECTURAL RATIONALE:
+    Summary text is stored as a frozen string at write time rather than constructed
+    dynamically on read. This ensures historical integrity: if a card named 'Fix Auth'
+    is logged and subsequently renamed to 'Refactor Login' or deleted entirely,
+    the activity log retains the precise factual summary of what occurred at that moment.
+    """
+
+    class Verb(models.TextChoices):
+        CARD_CREATED = "card.created", "Card Created"
+        CARD_MOVED = "card.moved", "Card Moved"
+        CARD_UPDATED = "card.updated", "Card Updated"
+        CARD_DELETED = "card.deleted", "Card Deleted"
+        CARD_ASSIGNED = "card.assigned", "Card Assigned"
+        LIST_CREATED = "list.created", "List Created"
+        LIST_RENAMED = "list.renamed", "List Renamed"
+        LIST_DELETED = "list.deleted", "List Deleted"
+        LIST_MOVED = "list.moved", "List Moved"
+        COMMENT_ADDED = "comment.added", "Comment Added"
+        COMMENT_EDITED = "comment.edited", "Comment Edited"
+        COMMENT_DELETED = "comment.deleted", "Comment Deleted"
+        MEMBER_ADDED = "member.added", "Member Added"
+        MEMBER_REMOVED = "member.removed", "Member Removed"
+        MEMBER_ROLE_CHANGED = "member.role_changed", "Member Role Changed"
+        BOARD_UPDATED = "board.updated", "Board Updated"
+
+    board = models.ForeignKey(
+        Board,
+        on_delete=models.CASCADE,
+        related_name="activities",
+        help_text="Board workspace where this activity occurred."
+    )
+
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="activities",
+        help_text="User who performed the action (null if system-generated)."
+    )
+
+    verb = models.CharField(
+        max_length=64,
+        choices=Verb.choices,
+        help_text="Machine-readable action identifier."
+    )
+
+    target_type = models.CharField(
+        max_length=50,
+        help_text="Entity type acted upon (card, list, comment, member, board)."
+    )
+
+    target_id = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Primary key of target entity at time of action."
+    )
+
+    summary = models.CharField(
+        max_length=500,
+        help_text="Human-readable summary frozen at write time."
+    )
+
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Supplemental structured context (e.g. source/target column names, diffs)."
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="Timestamp when the event transpired."
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            # High-performance index for board-filtered chronological cursor pagination
+            models.Index(fields=["board", "-created_at"]),
+        ]
+        verbose_name = "Activity"
+        verbose_name_plural = "Activities"
+
+    def __str__(self) -> str:
+        return f"[{self.board.title}] {self.summary}"
+
+
+# ==============================================================================
+# 6. COMMENT MODEL (Card discussion thread)
+# ==============================================================================
+
+class Comment(models.Model):
+    """
+    Represents an author comment attached to a specific Card.
+    """
+
+    card = models.ForeignKey(
+        Card,
+        on_delete=models.CASCADE,
+        related_name="comments",
+        help_text="Task card this comment is attached to."
+    )
+
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="card_comments",
+        help_text="User authoring this comment."
+    )
+
+    body = models.TextField(
+        max_length=2000,
+        help_text="Comment text (up to 2000 characters)."
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="Timestamp when comment was submitted."
+    )
+
+    edited_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when comment was last modified (null if never edited)."
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [
+            # Fast chronological retrieval of comments for a card
+            models.Index(fields=["card", "created_at"]),
+        ]
+        verbose_name = "Comment"
+        verbose_name_plural = "Comments"
+
+    def __str__(self) -> str:
+        return f"Comment by {self.author.username} on {self.card.title}"
+
+
+# ==============================================================================
+# 7. NOTIFICATION MODEL (In-app real-time alerts)
+# ==============================================================================
+
+class Notification(models.Model):
+    """
+    Represents an in-app alert dispatched to a specific recipient user.
+    """
+
+    class Kind(models.TextChoices):
+        MENTION = "MENTION", "Mention"
+        ASSIGNED = "ASSIGNED", "Assigned"
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+        help_text="User receiving this notification alert."
+    )
+
+    board = models.ForeignKey(
+        Board,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+        help_text="Board workspace related to this alert."
+    )
+
+    card = models.ForeignKey(
+        Card,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="notifications",
+        help_text="Card related to this alert (null if deleted or board-level)."
+    )
+
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="authored_notifications",
+        help_text="User whose action triggered this notification."
+    )
+
+    kind = models.CharField(
+        max_length=20,
+        choices=Kind.choices,
+        help_text="Classification category of this notification."
+    )
+
+    message = models.CharField(
+        max_length=255,
+        help_text="Human-readable notification text."
+    )
+
+    is_read = models.BooleanField(
+        default=False,
+        help_text="Read/unread status flag."
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="Timestamp when notification was created."
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            # Compound index for instant unread count badge queries and reverse-chronological list
+            models.Index(fields=["recipient", "is_read", "-created_at"]),
+        ]
+        verbose_name = "Notification"
+        verbose_name_plural = "Notifications"
+
+    def __str__(self) -> str:
+        return f"[{self.kind}] to {self.recipient.username}: {self.message}"
+
